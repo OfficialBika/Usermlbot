@@ -3,214 +3,168 @@ import json
 import logging
 import os
 import random
-from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional, Set
+from typing import Optional, List
 
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatType, ChatAction
-from pyrogram.errors import FloodWait, RPCError
-from pyrogram.types import Message
+from pyrogram.errors import FloodWait
+
+# ================= CONFIG =================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-STATE_FILE = os.path.join(BASE_DIR, "data", "state.json")
 LOCALES_DIR = os.path.join(BASE_DIR, "locales")
+
 SESSA_FILE = os.path.join(LOCALES_DIR, "sessa.txt")
 SESSB_FILE = os.path.join(LOCALES_DIR, "sessb.txt")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 
-EMOJIS = ["😂","😅","😆","😉","🔥","😎","😁","😄","🙂","🤭"]
+EMOJIS = ["😂","😅","😆","😎","🔥","🙂","🤭","😁"]
 
-DEFAULT_STATE = {
-    "enabled": False,
-    "sessa_index": 0,
-    "sessb_index": 0,
-    "sessa_history": [],
-    "sessb_history": [],
-}
+# ================= GLOBAL =================
 
-session_a_id: Optional[int] = None
-session_b_id: Optional[int] = None
-sessa_lines: List[str] = []
-sessb_lines: List[str] = []
-recent_auto_messages = set()
-message_lock = asyncio.Lock()
-last_trigger = {"from_a": None, "from_b": None}
-state: Dict[str, object] = DEFAULT_STATE.copy()
-
-logger = logging.getLogger("auto-chat")
-
-CONFIG: Dict[str, object] = {}
+CONFIG = {}
 app_a: Optional[Client] = None
 app_b: Optional[Client] = None
 
+session_a_id = None
+session_b_id = None
 
-def read_json(path: str) -> Dict[str, object]:
-    with open(path, "r", encoding="utf-8") as f:
+sessa_lines: List[str] = []
+sessb_lines: List[str] = []
+
+enabled = False
+
+# ================= LOAD =================
+
+def load_config():
+    with open(CONFIG_FILE, "r") as f:
         return json.load(f)
 
-
-def setup_logging(debug: bool) -> None:
-    os.makedirs(LOG_DIR, exist_ok=True)
-
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG if debug else logging.INFO)
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
-    root.handlers.clear()
-    root.addHandler(file_handler)
-    root.addHandler(stream_handler)
-
-
-def load_lines(path: str) -> List[str]:
-    lines = []
+def load_lines(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if line:
-                    lines.append(line)
+            return [x.strip() for x in f if x.strip()]
     except:
-        pass
-    return lines
+        return []
 
+# ================= CORE =================
 
-def reload_locales() -> None:
-    global sessa_lines, sessb_lines
-    sessa_lines = load_lines(SESSA_FILE)
-    sessb_lines = load_lines(SESSB_FILE)
-
-
-def normalize_text(text: str) -> str:
-    return (text or "").strip().lower()
-
-
-def allowed_chat(message: Message) -> bool:
-    if message.chat.id != CONFIG["group_id"]:
-        return False
-    return message.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
-
-
-async def ensure_me_ids() -> None:
+async def ensure_ids():
     global session_a_id, session_b_id
-    if session_a_id is None:
+    if not session_a_id:
         session_a_id = (await app_a.get_me()).id
-    if session_b_id is None:
+    if not session_b_id:
         session_b_id = (await app_b.get_me()).id
 
 
-def get_next_line(which: str):
-    if which == "sessa":
-        lines = sessa_lines
-        key = "sessa_index"
+def get_text(which):
+    if which == "a":
+        text = random.choice(sessa_lines)
     else:
-        lines = sessb_lines
-        key = "sessb_index"
+        text = random.choice(sessb_lines)
 
-    if not lines:
-        return None
-
-    idx = int(state.get(key, 0))
-    line = lines[idx]
-    idx = (idx + 1) % len(lines)
-    state[key] = idx
-
-    # add random emoji sometimes
+    # emoji chance
     if random.random() < 0.4:
-        line += " " + random.choice(EMOJIS)
+        text += " " + random.choice(EMOJIS)
 
-    return line
+    return text
 
 
-async def send_message_smart(sender_app, chat_id, reply_to_id, text):
+async def send_human(app, chat_id, reply_to, text):
     try:
-        delay = random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"])
-        await asyncio.sleep(delay)
+        # delay
+        await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
 
-        # typing action
-        await sender_app.send_chat_action(chat_id, ChatAction.TYPING)
-        await asyncio.sleep(random.uniform(2, 4))
+        # typing
+        await app.send_chat_action(chat_id, ChatAction.TYPING)
+        await asyncio.sleep(random.uniform(2, 5))
 
-        # 70% plain, 30% reply
+        # 70% plain / 30% reply
         if random.random() < 0.7:
-            msg = await sender_app.send_message(chat_id, text)
+            await app.send_message(chat_id, text)
         else:
-            msg = await sender_app.send_message(chat_id, text, reply_to_message_id=reply_to_id)
-
-        recent_auto_messages.add(msg.id)
-        return msg
+            await app.send_message(chat_id, text, reply_to_message_id=reply_to)
 
     except FloodWait as e:
         await asyncio.sleep(e.value)
-    except RPCError as e:
-        logger.error(e)
 
 
-def register_handlers():
-    @app_a.on_message(filters.text)
-    async def commands(_, message: Message):
-        if message.from_user.id != CONFIG["owner_id"]:
-            return
-        if message.text == "/open":
-            state["enabled"] = True
-            await message.reply("Auto ON")
-        elif message.text == "/close":
-            state["enabled"] = False
-            await message.reply("Auto OFF")
+# ================= HANDLERS =================
+
+def register():
 
     @app_a.on_message(filters.text)
-    async def watch_a(_, message: Message):
-        if not state["enabled"]:
-            return
-        if not allowed_chat(message):
+    async def commands(_, m):
+        global enabled
+
+        if m.from_user.id != CONFIG["owner_id"]:
             return
 
-        await ensure_me_ids()
+        if m.text == "/open":
+            enabled = True
+            await m.reply("✅ ON")
+        elif m.text == "/close":
+            enabled = False
+            await m.reply("❌ OFF")
 
-        if message.from_user.id == session_a_id:
-            text = get_next_line("sessb")
-            if text:
-                await send_message_smart(app_b, CONFIG["group_id"], message.id, text)
+
+    @app_a.on_message(filters.text)
+    async def watch_a(_, m):
+        if not enabled:
+            return
+
+        if m.chat.id != CONFIG["group_id"]:
+            return
+
+        await ensure_ids()
+
+        if m.from_user.id == session_a_id:
+            text = get_text("b")
+            await send_human(app_b, CONFIG["group_id"], m.id, text)
+
 
     @app_b.on_message(filters.text)
-    async def watch_b(_, message: Message):
-        if not state["enabled"]:
-            return
-        if not allowed_chat(message):
+    async def watch_b(_, m):
+        if not enabled:
             return
 
-        await ensure_me_ids()
+        if not CONFIG["enable_two_way"]:
+            return
 
-        if message.from_user.id == session_b_id:
-            text = get_next_line("sessa")
-            if text:
-                await send_message_smart(app_a, CONFIG["group_id"], message.id, text)
+        if m.chat.id != CONFIG["group_id"]:
+            return
 
+        await ensure_ids()
+
+        if m.from_user.id == session_b_id:
+            text = get_text("a")
+            await send_human(app_a, CONFIG["group_id"], m.id, text)
+
+
+# ================= START =================
 
 async def main():
-    global CONFIG, app_a, app_b
+    global CONFIG, app_a, app_b, sessa_lines, sessb_lines
 
-    CONFIG = read_json(CONFIG_FILE)
-    setup_logging(CONFIG.get("debug", False))
-    reload_locales()
+    CONFIG = load_config()
+
+    sessa_lines = load_lines(SESSA_FILE)
+    sessb_lines = load_lines(SESSB_FILE)
 
     app_a = Client(CONFIG["session_a"], CONFIG["api_id"], CONFIG["api_hash"])
     app_b = Client(CONFIG["session_b"], CONFIG["api_id"], CONFIG["api_hash"])
 
-    register_handlers()
+    register()
 
     await app_a.start()
     await app_b.start()
 
-    print("Bot Started")
+    # 🔥 IMPORTANT FIX (Peer id invalid)
+    await app_a.get_dialogs()
+    await app_b.get_dialogs()
+
+    print("✅ Bot Running")
+
     await idle()
 
     await app_a.stop()
