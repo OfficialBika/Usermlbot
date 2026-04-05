@@ -79,7 +79,6 @@ def get_text(which):
 async def send_human(app, chat_id, reply_to, text):
     try:
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
-
         await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(random.uniform(2, 5))
 
@@ -92,7 +91,6 @@ async def send_human(app, chat_id, reply_to, text):
         await asyncio.sleep(e.value)
     except Exception as e:
         print("send_human error:", e)
-
 # ================= HANDLERS =================
 
 def register():
@@ -102,15 +100,12 @@ def register():
 
         if not m.from_user:
             return
-
         if m.from_user.id != CONFIG["owner_id"]:
             return
 
         if m.text == "/open":
             enabled = True
             await m.reply("✅ ON")
-
-            # start conversation from A
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], None, text)
 
@@ -118,8 +113,7 @@ def register():
             enabled = False
             await m.reply("❌ OFF")
 
-    # app_a watches B's messages and replies as A
-    @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
+    @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
     async def watch_a(_, m):
         if not enabled:
             return
@@ -127,15 +121,14 @@ def register():
             return
 
         await ensure_ids()
-        print("watch_a triggered:", m.from_user.id)
+        print("watch_a triggered:", m.from_user.id, m.text)
 
         if m.from_user.id == session_b_id:
             print("B sent -> A reply")
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], m.id, text)
 
-    # app_b watches A's messages and replies as B
-    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
+    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
     async def watch_b(_, m):
         if not enabled:
             return
@@ -145,7 +138,7 @@ def register():
             return
 
         await ensure_ids()
-        print("watch_b triggered:", m.from_user.id)
+        print("watch_b triggered:", m.from_user.id, m.text)
 
         if m.from_user.id == session_a_id:
             print("A sent -> B reply")
