@@ -173,5 +173,6 @@ async def main():
     await app_a.stop()
     await app_b.stop()
 
+
 if __name__ == "__main__":
     asyncio.run(main())
