@@ -97,13 +97,19 @@ def register():
     async def commands(_, m):
         global enabled
 
-        if m.from_user and m.from_user.id == CONFIG["owner_id"]:
-            if m.text == "/open":
-                enabled = True
-                await m.reply("✅ ON")
-            elif m.text == "/close":
-                enabled = False
-                await m.reply("❌ OFF")
+        if not m.from_user:
+            return
+
+        if m.from_user.id != CONFIG["owner_id"]:
+            return
+
+        if m.text == "/open":
+            enabled = True
+            await m.reply("✅ ON")
+
+        elif m.text == "/close":
+            enabled = False
+            await m.reply("❌ OFF")
 
 
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
@@ -111,10 +117,15 @@ def register():
         if not enabled:
             return
 
+        if not m.from_user:
+            return
+
         await ensure_ids()
 
-        if m.from_user and m.from_user.id == session_a_id:
-            print("A sent message -> B will reply")
+        print("Message in group from:", m.from_user.id)
+
+        if m.from_user.id == session_a_id:
+            print("A sent -> B reply")
 
             text = get_text("b")
             await send_human(app_b, CONFIG["group_id"], m.id, text)
@@ -128,10 +139,15 @@ def register():
         if not CONFIG["enable_two_way"]:
             return
 
+        if not m.from_user:
+            return
+
         await ensure_ids()
 
-        if m.from_user and m.from_user.id == session_b_id:
-            print("B sent message -> A will reply")
+        print("Message in group from:", m.from_user.id)
+
+        if m.from_user.id == session_b_id:
+            print("B sent -> A reply")
 
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], m.id, text)
