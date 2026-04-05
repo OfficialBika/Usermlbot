@@ -83,14 +83,18 @@ async def send_human(app, chat_id, reply_to, text):
         await asyncio.sleep(random.uniform(2, 5))
 
         if random.random() < 0.8 or not reply_to:
-            await app.send_message(chat_id, text)
+            msg = await app.send_message(chat_id, text)
         else:
-            await app.send_message(chat_id, text, reply_to_message_id=reply_to)
+            msg = await app.send_message(chat_id, text, reply_to_message_id=reply_to)
+
+        return msg
 
     except FloodWait as e:
         await asyncio.sleep(e.value)
+        return None
     except Exception as e:
         print("send_human error:", e)
+        return None
 # ================= HANDLERS =================
 
 def register():
@@ -106,33 +110,17 @@ def register():
         if m.text == "/open":
             enabled = True
             await m.reply("✅ ON")
-            text = get_text("a")
-            await send_human(app_a, CONFIG["group_id"], None, text)
+
+            first_text = get_text("a")
+            await send_human(app_a, CONFIG["group_id"], None, first_text)
 
         elif m.text == "/close":
             enabled = False
             await m.reply("❌ OFF")
 
-    @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-    async def watch_a(_, m):
-        if not enabled:
-            return
-        if not m.from_user:
-            return
-
-        await ensure_ids()
-        print("watch_a triggered:", m.from_user.id, m.text)
-
-        if m.from_user.id == session_b_id:
-            print("B sent -> A reply")
-            text = get_text("a")
-            await send_human(app_a, CONFIG["group_id"], m.id, text)
-
     @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
     async def watch_b(_, m):
         if not enabled:
-            return
-        if not CONFIG["enable_two_way"]:
             return
         if not m.from_user:
             return
@@ -142,8 +130,11 @@ def register():
 
         if m.from_user.id == session_a_id:
             print("A sent -> B reply")
-            text = get_text("b")
-            await send_human(app_b, CONFIG["group_id"], m.id, text)
+            msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
+
+            if msg_b:
+                print("B sent -> A reply")
+                await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
 # ================= START =================
 
 async def main():
