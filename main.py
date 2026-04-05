@@ -159,20 +159,19 @@ async def main():
     await app_a.start()
     await app_b.start()
 
-    # 🔥 IMPORTANT FIX (Peer id invalid)
+    # Load dialogs (Fix Peer ID invalid)
     async for _ in app_a.get_dialogs():
-    pass
+        pass
 
-async for _ in app_b.get_dialogs():
-    pass
+    async for _ in app_b.get_dialogs():
+        pass
 
-    print("✅ Bot Running")
+    print("Bot Running...")
 
     await idle()
 
     await app_a.stop()
     await app_b.stop()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
