@@ -160,8 +160,11 @@ async def main():
     await app_b.start()
 
     # 🔥 IMPORTANT FIX (Peer id invalid)
-    await app_a.get_dialogs()
-    await app_b.get_dialogs()
+    async for _ in app_a.get_dialogs():
+    pass
+
+async for _ in app_b.get_dialogs():
+    pass
 
     print("✅ Bot Running")
 
