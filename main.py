@@ -93,37 +93,34 @@ async def send_human(app, chat_id, reply_to, text):
 
 def register():
 
-    @app_a.on_message(filters.text)
+    @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def commands(_, m):
         global enabled
 
-        if m.from_user.id != CONFIG["owner_id"]:
-            return
-
-        if m.text == "/open":
-            enabled = True
-            await m.reply("✅ ON")
-        elif m.text == "/close":
-            enabled = False
-            await m.reply("❌ OFF")
+        if m.from_user and m.from_user.id == CONFIG["owner_id"]:
+            if m.text == "/open":
+                enabled = True
+                await m.reply("✅ ON")
+            elif m.text == "/close":
+                enabled = False
+                await m.reply("❌ OFF")
 
 
-    @app_a.on_message(filters.text)
+    @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def watch_a(_, m):
         if not enabled:
             return
 
-        if m.chat.id != CONFIG["group_id"]:
-            return
-
         await ensure_ids()
 
-        if m.from_user.id == session_a_id:
+        if m.from_user and m.from_user.id == session_a_id:
+            print("A sent message -> B will reply")
+
             text = get_text("b")
             await send_human(app_b, CONFIG["group_id"], m.id, text)
 
 
-    @app_b.on_message(filters.text)
+    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def watch_b(_, m):
         if not enabled:
             return
@@ -131,15 +128,13 @@ def register():
         if not CONFIG["enable_two_way"]:
             return
 
-        if m.chat.id != CONFIG["group_id"]:
-            return
-
         await ensure_ids()
 
-        if m.from_user.id == session_b_id:
+        if m.from_user and m.from_user.id == session_b_id:
+            print("B sent message -> A will reply")
+
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], m.id, text)
-
 
 # ================= START =================
 
