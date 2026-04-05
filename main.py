@@ -79,6 +79,7 @@ def get_text(which):
 async def send_human(app, chat_id, reply_to, text):
     try:
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
+
         await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(random.uniform(2, 5))
 
@@ -109,6 +110,7 @@ def register():
             enabled = True
             await m.reply("✅ ON")
 
+            # start conversation from A
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], None, text)
 
