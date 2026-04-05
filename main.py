@@ -164,17 +164,19 @@ async def main():
     app_a = Client(CONFIG["session_a"], CONFIG["api_id"], CONFIG["api_hash"])
     app_b = Client(CONFIG["session_b"], CONFIG["api_id"], CONFIG["api_hash"])
 
-    register()
-
     await app_a.start()
     await app_b.start()
 
-    # Load dialogs (Fix Peer ID invalid)
     async for _ in app_a.get_dialogs():
         pass
-
     async for _ in app_b.get_dialogs():
         pass
+
+    await ensure_ids()
+    print("Session A ID:", session_a_id)
+    print("Session B ID:", session_b_id)
+
+    register()
 
     print("Bot Running...")
 
