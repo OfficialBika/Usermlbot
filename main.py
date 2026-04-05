@@ -66,8 +66,12 @@ def get_text(which):
         text = random.choice(sessb_lines)
 
     # emoji chance
-    if random.random() < 0.4:
+    if random.random() < 0.5:
         text += " " + random.choice(EMOJIS)
+
+    # small chance send only emoji
+    if random.random() < 0.1:
+        text = random.choice(EMOJIS)
 
     return text
 
@@ -81,15 +85,14 @@ async def send_human(app, chat_id, reply_to, text):
         await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(random.uniform(2, 5))
 
-        # 70% plain / 30% reply
-        if random.random() < 0.7:
+        # 80% plain / 20% reply
+        if random.random() < 0.8:
             await app.send_message(chat_id, text)
         else:
             await app.send_message(chat_id, text, reply_to_message_id=reply_to)
 
     except FloodWait as e:
         await asyncio.sleep(e.value)
-
 
 # ================= HANDLERS =================
 
@@ -115,46 +118,48 @@ def register():
 
 
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
-    async def watch_a(_, m):
-        global last_sender
+async def watch_a(_, m):
+    global last_sender
 
-        if not enabled:
-            return
+    if not enabled:
+        return
 
-        if not m.from_user:
-            return
+    if not m.from_user:
+        return
 
-        await ensure_ids()
+    await ensure_ids()
 
-        if m.from_user.id == session_a_id:
-            print("A sent -> B reply")
+    # Only react if sender is A and last sender wasn't B
+    if m.from_user.id == session_a_id and last_sender != "b":
+        print("A sent -> B reply")
 
-            last_sender = "a"
-            text = get_text("b")
-            await send_human(app_b, CONFIG["group_id"], m.id, text)
+        last_sender = "a"
+        text = get_text("b")
+        await send_human(app_b, CONFIG["group_id"], m.id, text)
 
 
-    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
-    async def watch_b(_, m):
-        global last_sender
+@app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
+async def watch_b(_, m):
+    global last_sender
 
-        if not enabled:
-            return
+    if not enabled:
+        return
 
-        if not CONFIG["enable_two_way"]:
-            return
+    if not CONFIG["enable_two_way"]:
+        return
 
-        if not m.from_user:
-            return
+    if not m.from_user:
+        return
 
-        await ensure_ids()
+    await ensure_ids()
 
-        if m.from_user.id == session_b_id:
-            print("B sent -> A reply")
+    # Only react if sender is B and last sender wasn't A
+    if m.from_user.id == session_b_id and last_sender != "a":
+        print("B sent -> A reply")
 
-            last_sender = "b"
-            text = get_text("a")
-            await send_human(app_a, CONFIG["group_id"], m.id, text)
+        last_sender = "b"
+        text = get_text("a")
+        await send_human(app_a, CONFIG["group_id"], m.id, text)
 
 # ================= START =================
 
