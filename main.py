@@ -26,6 +26,8 @@ CONFIG = {}
 app_a: Optional[Client] = None
 app_b: Optional[Client] = None
 
+last_sender = None
+
 session_a_id = None
 session_b_id = None
 
@@ -114,6 +116,8 @@ def register():
 
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def watch_a(_, m):
+        global last_sender
+
         if not enabled:
             return
 
@@ -122,17 +126,18 @@ def register():
 
         await ensure_ids()
 
-        print("Message in group from:", m.from_user.id)
-
         if m.from_user.id == session_a_id:
             print("A sent -> B reply")
 
+            last_sender = "a"
             text = get_text("b")
             await send_human(app_b, CONFIG["group_id"], m.id, text)
 
 
     @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def watch_b(_, m):
+        global last_sender
+
         if not enabled:
             return
 
@@ -144,11 +149,10 @@ def register():
 
         await ensure_ids()
 
-        print("Message in group from:", m.from_user.id)
-
         if m.from_user.id == session_b_id:
             print("B sent -> A reply")
 
+            last_sender = "b"
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], m.id, text)
 
