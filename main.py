@@ -78,15 +78,12 @@ def get_text(which):
 
 async def send_human(app, chat_id, reply_to, text):
     try:
-        # delay
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
 
-        # typing
         await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(random.uniform(2, 5))
 
-        # 80% plain / 20% reply
-        if random.random() < 0.8:
+        if random.random() < 0.8 or not reply_to:
             await app.send_message(chat_id, text)
         else:
             await app.send_message(chat_id, text, reply_to_message_id=reply_to)
@@ -97,7 +94,6 @@ async def send_human(app, chat_id, reply_to, text):
 # ================= HANDLERS =================
 
 def register():
-
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def commands(_, m):
         global enabled
@@ -112,53 +108,50 @@ def register():
             enabled = True
             await m.reply("✅ ON")
 
-            # start conversation
+            # start conversation from A
             text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], None, text)
-
 
         elif m.text == "/close":
             enabled = False
             await m.reply("❌ OFF")
 
-
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
-async def watch_a(_, m):
+    async def watch_a(_, m):
+        if not enabled:
+            return
 
-    if not enabled:
-        return
+        if not m.from_user:
+            return
 
-    if not m.from_user:
-        return
+        await ensure_ids()
 
-    await ensure_ids()
+        print("watch_a triggered:", m.from_user.id)
 
-    if m.from_user.id == session_a_id:
-        print("A sent -> B reply")
+        if m.from_user.id == session_a_id:
+            print("A sent -> B reply")
+            text = get_text("b")
+            await send_human(app_b, CONFIG["group_id"], m.id, text)
 
-        text = get_text("b")
-        await send_human(app_b, CONFIG["group_id"], m.id, text)
+    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
+    async def watch_b(_, m):
+        if not enabled:
+            return
 
+        if not CONFIG["enable_two_way"]:
+            return
 
-@app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
-async def watch_b(_, m):
+        if not m.from_user:
+            return
 
-    if not enabled:
-        return
+        await ensure_ids()
 
-    if not CONFIG["enable_two_way"]:
-        return
+        print("watch_b triggered:", m.from_user.id)
 
-    if not m.from_user:
-        return
-
-    await ensure_ids()
-
-    if m.from_user.id == session_b_id:
-        print("B sent -> A reply")
-
-        text = get_text("a")
-        await send_human(app_a, CONFIG["group_id"], m.id, text)
+        if m.from_user.id == session_b_id:
+            print("B sent -> A reply")
+            text = get_text("a")
+            await send_human(app_a, CONFIG["group_id"], m.id, text)
 # ================= START =================
 
 async def main():
