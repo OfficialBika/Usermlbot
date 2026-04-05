@@ -1,0 +1,12 @@
+{
+  "api_id": 12345678,
+  "api_hash": "your_api_hash",
+  "session_a": "session_a",
+  "session_b": "session_b",
+  "owner_id": 123456789,
+  "group_id": -1001234567890,
+  "enable_two_way": false,
+  "min_reply_delay": 8,
+  "max_reply_delay": 25,
+  "debug": false
+}
