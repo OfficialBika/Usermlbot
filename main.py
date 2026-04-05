@@ -112,55 +112,53 @@ def register():
             enabled = True
             await m.reply("✅ ON")
 
+            # start conversation
+            text = get_text("a")
+            await send_human(app_a, CONFIG["group_id"], None, text)
+
+
         elif m.text == "/close":
             enabled = False
             await m.reply("❌ OFF")
 
 
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
-    async def watch_a(_, m):
-        global last_sender
+async def watch_a(_, m):
 
-        if not enabled:
-            return
+    if not enabled:
+        return
 
-        if not m.from_user:
-            return
+    if not m.from_user:
+        return
 
-        await ensure_ids()
+    await ensure_ids()
 
-        # Only react if sender is A and last sender wasn't B
-        if m.from_user.id == session_a_id and last_sender != "b":
-            print("A sent -> B reply")
+    if m.from_user.id == session_a_id:
+        print("A sent -> B reply")
 
-            last_sender = "a"
-            text = get_text("b")
-            await send_human(app_b, CONFIG["group_id"], m.id, text)
+        text = get_text("b")
+        await send_human(app_b, CONFIG["group_id"], m.id, text)
 
 
-    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
-    async def watch_b(_, m):
-        global last_sender
+@app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
+async def watch_b(_, m):
 
-        if not enabled:
-            return
+    if not enabled:
+        return
 
-        if not CONFIG["enable_two_way"]:
-            return
+    if not CONFIG["enable_two_way"]:
+        return
 
-        if not m.from_user:
-            return
+    if not m.from_user:
+        return
 
-        await ensure_ids()
+    await ensure_ids()
 
-        # Only react if sender is B and last sender wasn't A
-        if m.from_user.id == session_b_id and last_sender != "a":
-            print("B sent -> A reply")
+    if m.from_user.id == session_b_id:
+        print("B sent -> A reply")
 
-            last_sender = "b"
-            text = get_text("a")
-            await send_human(app_a, CONFIG["group_id"], m.id, text)
-
+        text = get_text("a")
+        await send_human(app_a, CONFIG["group_id"], m.id, text)
 # ================= START =================
 
 async def main():
