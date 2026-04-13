@@ -73,8 +73,15 @@ def load_config() -> dict:
 
 
 def setup_logging(debug: bool) -> None:
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s")
+    level = logging.DEBUG if debug else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s"
+    )
+
+    logging.getLogger("pyrogram").setLevel(logging.ERROR)
+    logging.getLogger("asyncio").setLevel(logging.ERROR)
+    logging.getLogger("aiohttp").setLevel(logging.ERROR)
 
 
 def load_lines(path: str) -> List[str]:
@@ -113,23 +120,64 @@ def get_text(which: str) -> str:
     return text
 
 
+def is_spawn_alert_message(m) -> bool:
+    text = (m.text or "").strip().lower()
+    caption = (m.caption or "").strip().lower()
+    content = f"{text}\n{caption}"
+
+    triggers = [
+        "a character has spawned in the chat",
+        "add this character to your harem using /catch",
+        "a special character is about to spawn",
+        "solve the captcha in 60 seconds",
+    ]
+
+    return any(trigger in content for trigger in triggers)
+
+
+async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] = None):
+    owner_mention = f'<a href="tg://user?id={CONFIG["owner_id"]}">Owner</a>'
+    text = f"{owner_mention} spawn alert!"
+
+    try:
+        if reply_to:
+            return await app.send_message(
+                chat_id,
+                text,
+                reply_to_message_id=reply_to,
+                parse_mode="html"
+            )
+
+        return await app.send_message(
+            chat_id,
+            text,
+            parse_mode="html"
+        )
+    except Exception as e:
+        logging.warning("send_owner_mention failed: %s", e)
+        return None
+
+
 async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: str):
     try:
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
         await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(random.uniform(2, 4))
 
-        if random.random() < 0.8 or not reply_to:
-            msg = await app.send_message(chat_id, text)
-        else:
-            msg = await app.send_message(chat_id, text, reply_to_message_id=reply_to)
-        return msg
+        if reply_to:
+            try:
+                return await app.send_message(chat_id, text, reply_to_message_id=reply_to)
+            except Exception as e:
+                logging.warning("reply send failed, fallback to normal message: %s", e)
+
+        return await app.send_message(chat_id, text)
+
     except FloodWait as e:
         logging.warning("FloodWait: sleeping %s seconds", e.value)
         await asyncio.sleep(e.value)
         return None
     except Exception as e:
-        logging.exception("send_human error: %s", e)
+        logging.warning("send_human failed: %s", e)
         return None
 
 
@@ -175,17 +223,34 @@ def register_handlers() -> None:
             await m.reply("✅ ON")
             first_text = get_text("a")
             await send_human(app_a, CONFIG["group_id"], None, first_text)
+
         elif m.text == "/close":
             enabled = False
             await m.reply("❌ OFF")
+
         elif m.text == "/status":
             await m.reply(
                 f"enabled={enabled}\n"
                 f"group_id={CONFIG['group_id']}\n"
                 f"enable_two_way={CONFIG['enable_two_way']}"
             )
+
         elif m.text == "/help":
             await m.reply("/open\n/close\n/status\n/help")
+
+    @app_a.on_message(filters.chat(CONFIG["group_id"]))
+    async def detect_spawn_alert(_, m):
+        is_bot_message = bool(
+            (m.from_user and m.from_user.is_bot) or m.sender_chat
+        )
+
+        if not is_bot_message:
+            return
+
+        if not is_spawn_alert_message(m):
+            return
+
+        await send_owner_mention(app_a, CONFIG["group_id"], m.id)
 
     @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
     async def watch_b(_, m):
@@ -195,13 +260,10 @@ def register_handlers() -> None:
             return
 
         await ensure_ids()
-        logging.debug("watch_b triggered: from=%s text=%s", m.from_user.id, m.text)
 
         if m.from_user.id == session_a_id:
-            logging.info("A sent -> B reply")
             msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
             if msg_b:
-                logging.info("B sent -> A reply")
                 await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
 
     if CONFIG["enable_two_way"]:
@@ -213,13 +275,10 @@ def register_handlers() -> None:
                 return
 
             await ensure_ids()
-            logging.debug("watch_a triggered: from=%s text=%s", m.from_user.id, m.text)
 
             if m.from_user.id == session_b_id:
-                logging.info("B sent -> A reply (two-way)")
                 msg_a = await send_human(app_a, CONFIG["group_id"], m.id, get_text("a"))
                 if msg_a:
-                    logging.info("A sent -> B reply (two-way)")
                     await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
 
 
@@ -253,17 +312,12 @@ async def main() -> None:
     await app_b.start()
     await ensure_ids()
 
-    logging.info("Session A ID: %s", session_a_id)
-    logging.info("Session B ID: %s", session_b_id)
-
     register_handlers()
     http_runner = await start_http_server()
 
-    logging.info("Bot running...")
     try:
         await idle()
     finally:
-        logging.info("Shutting down...")
         await http_runner.cleanup()
         await app_a.stop()
         await app_b.stop()
