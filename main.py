@@ -51,8 +51,8 @@ def getenv_int(name: str, default: int) -> int:
 
 
 def load_config() -> dict:
-    min_delay = getenv_int("MIN_REPLY_DELAY", 8)
-    max_delay = getenv_int("MAX_REPLY_DELAY", 12)
+    min_delay = getenv_int("MIN_REPLY_DELAY", 2)
+    max_delay = getenv_int("MAX_REPLY_DELAY", 3.5)
     if min_delay > max_delay:
         min_delay, max_delay = max_delay, min_delay
 
