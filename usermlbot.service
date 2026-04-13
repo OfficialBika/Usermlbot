@@ -1,0 +1,15 @@
+[Unit]
+Description=Usermlbot Pyrogram Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Usermlbot
+EnvironmentFile=/home/ubuntu/Usermlbot/.env
+ExecStart=/home/ubuntu/Usermlbot/venv/bin/python /home/ubuntu/Usermlbot/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
