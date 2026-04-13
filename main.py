@@ -5,7 +5,6 @@ import random
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatAction
 from pyrogram.errors import FloodWait
@@ -67,8 +66,6 @@ def load_config() -> dict:
         "min_reply_delay": min_delay,
         "max_reply_delay": max_delay,
         "debug": getenv_bool("DEBUG", False),
-        "port": getenv_int("PORT", 10000),
-        "host": os.getenv("HOST", "0.0.0.0"),
     }
 
 
@@ -76,12 +73,13 @@ def setup_logging(debug: bool) -> None:
     level = logging.DEBUG if debug else logging.WARNING
     logging.basicConfig(
         level=level,
-        format="%(asctime)s | %(levelname)s | %(message)s"
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        force=True,
     )
 
-    logging.getLogger("pyrogram").setLevel(logging.ERROR)
-    logging.getLogger("asyncio").setLevel(logging.ERROR)
-    logging.getLogger("aiohttp").setLevel(logging.ERROR)
+    logging.getLogger().setLevel(level)
+    logging.getLogger("pyrogram").setLevel(logging.CRITICAL)
+    logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 
 def load_lines(path: str) -> List[str]:
@@ -145,13 +143,12 @@ async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] 
                 chat_id,
                 text,
                 reply_to_message_id=reply_to,
-                parse_mode="html"
+                parse_mode="html",
             )
-
         return await app.send_message(
             chat_id,
             text,
-            parse_mode="html"
+            parse_mode="html",
         )
     except Exception as e:
         logging.warning("send_owner_mention failed: %s", e)
@@ -181,94 +178,56 @@ async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: s
         return None
 
 
-async def health(_: web.Request) -> web.Response:
-    status = {
-        "ok": True,
-        "enabled": enabled,
-        "session_a_started": app_a is not None,
-        "session_b_started": app_b is not None,
-    }
-    return web.json_response(status, status=200)
-
-
-async def root(_: web.Request) -> web.Response:
-    return web.Response(text="Usermlbot is running", status=200)
-
-
-async def start_http_server() -> web.AppRunner:
-    web_app = web.Application()
-    web_app.router.add_get("/", root)
-    web_app.router.add_get("/health", health)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, host=CONFIG["host"], port=CONFIG["port"])
-    await site.start()
-
-    logging.info("HTTP server started on %s:%s", CONFIG["host"], CONFIG["port"])
-    return runner
-
-
 def register_handlers() -> None:
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def commands(_, m):
         global enabled
-        if not m.from_user:
-            return
-        if m.from_user.id != CONFIG["owner_id"]:
-            return
+        try:
+            if not m.from_user:
+                return
+            if m.from_user.id != CONFIG["owner_id"]:
+                return
 
-        if m.text == "/open":
-            enabled = True
-            await m.reply("✅ ON")
-            first_text = get_text("a")
-            await send_human(app_a, CONFIG["group_id"], None, first_text)
+            if m.text == "/open":
+                enabled = True
+                await m.reply("✅ ON")
+                first_text = get_text("a")
+                await send_human(app_a, CONFIG["group_id"], None, first_text)
 
-        elif m.text == "/close":
-            enabled = False
-            await m.reply("❌ OFF")
+            elif m.text == "/close":
+                enabled = False
+                await m.reply("❌ OFF")
 
-        elif m.text == "/status":
-            await m.reply(
-                f"enabled={enabled}\n"
-                f"group_id={CONFIG['group_id']}\n"
-                f"enable_two_way={CONFIG['enable_two_way']}"
-            )
+            elif m.text == "/status":
+                await m.reply(
+                    f"enabled={enabled}\n"
+                    f"group_id={CONFIG['group_id']}\n"
+                    f"enable_two_way={CONFIG['enable_two_way']}"
+                )
 
-        elif m.text == "/help":
-            await m.reply("/open\n/close\n/status\n/help")
+            elif m.text == "/help":
+                await m.reply("/open\n/close\n/status\n/help")
+        except Exception as e:
+            logging.warning("commands handler failed: %s", e)
 
     @app_a.on_message(filters.chat(CONFIG["group_id"]))
     async def detect_spawn_alert(_, m):
-        is_bot_message = bool(
-            (m.from_user and m.from_user.is_bot) or m.sender_chat
-        )
+        try:
+            is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
 
-        if not is_bot_message:
-            return
+            if not is_bot_message:
+                return
 
-        if not is_spawn_alert_message(m):
-            return
+            if not is_spawn_alert_message(m):
+                return
 
-        await send_owner_mention(app_a, CONFIG["group_id"], m.id)
+            await send_owner_mention(app_a, CONFIG["group_id"], m.id)
+        except Exception as e:
+            logging.warning("detect_spawn_alert failed: %s", e)
 
     @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
     async def watch_b(_, m):
-        if not enabled:
-            return
-        if not m.from_user:
-            return
-
-        await ensure_ids()
-
-        if m.from_user.id == session_a_id:
-            msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
-            if msg_b:
-                await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
-
-    if CONFIG["enable_two_way"]:
-        @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-        async def watch_a(_, m):
+        try:
             if not enabled:
                 return
             if not m.from_user:
@@ -276,10 +235,30 @@ def register_handlers() -> None:
 
             await ensure_ids()
 
-            if m.from_user.id == session_b_id:
-                msg_a = await send_human(app_a, CONFIG["group_id"], m.id, get_text("a"))
-                if msg_a:
-                    await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
+            if m.from_user.id == session_a_id:
+                msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
+                if msg_b:
+                    await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+        except Exception as e:
+            logging.warning("watch_b failed: %s", e)
+
+    if CONFIG["enable_two_way"]:
+        @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
+        async def watch_a(_, m):
+            try:
+                if not enabled:
+                    return
+                if not m.from_user:
+                    return
+
+                await ensure_ids()
+
+                if m.from_user.id == session_b_id:
+                    msg_a = await send_human(app_a, CONFIG["group_id"], m.id, get_text("a"))
+                    if msg_a:
+                        await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
+            except Exception as e:
+                logging.warning("watch_a failed: %s", e)
 
 
 async def main() -> None:
@@ -313,12 +292,10 @@ async def main() -> None:
     await ensure_ids()
 
     register_handlers()
-    http_runner = await start_http_server()
 
     try:
         await idle()
     finally:
-        await http_runner.cleanup()
         await app_a.stop()
         await app_b.stop()
 
