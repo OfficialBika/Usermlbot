@@ -52,7 +52,7 @@ def getenv_int(name: str, default: int) -> int:
 
 def load_config() -> dict:
     min_delay = getenv_int("MIN_REPLY_DELAY", 2)
-    max_delay = getenv_int("MAX_REPLY_DELAY", 3.5)
+    max_delay = getenv_int("MAX_REPLY_DELAY", 4)
     if min_delay > max_delay:
         min_delay, max_delay = max_delay, min_delay
 
@@ -117,7 +117,7 @@ async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: s
     try:
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
         await app.send_chat_action(chat_id, ChatAction.TYPING)
-        await asyncio.sleep(random.uniform(2, 5))
+        await asyncio.sleep(random.uniform(2, 4))
 
         if random.random() < 0.8 or not reply_to:
             msg = await app.send_message(chat_id, text)
