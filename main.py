@@ -4,10 +4,13 @@ import os
 import random
 from typing import List, Optional
 
+from dotenv import load_dotenv
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatAction
 from pyrogram.errors import FloodWait
+
+load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCALES_DIR = os.path.join(BASE_DIR, "locales")
