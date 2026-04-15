@@ -73,8 +73,6 @@ def load_config() -> dict:
     if min_delay > max_delay:
         min_delay, max_delay = max_delay, min_delay
 
-    "reply_chance": getenv_float("REPLY_CHANCE", 0.25),
-
     return {
         "api_id": int(getenv_required("API_ID")),
         "api_hash": getenv_required("API_HASH"),
@@ -84,6 +82,7 @@ def load_config() -> dict:
         "group_id": int(getenv_required("GROUP_ID")),
         "min_reply_delay": min_delay,
         "max_reply_delay": max_delay,
+        "reply_chance": getenv_float("REPLY_CHANCE", 0.25),
         "debug": getenv_bool("DEBUG", False),
     }
 
