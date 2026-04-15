@@ -168,6 +168,16 @@ def is_spawn_alert_message(m) -> bool:
     return has_trigger_emoji or has_trigger_keyword
 
 
+def is_from_account_a(m) -> bool:
+    user_id = getattr(m.from_user, "id", None)
+    return user_id in {session_a_id, CONFIG["owner_id"]}
+
+
+def is_from_account_b(m) -> bool:
+    user_id = getattr(m.from_user, "id", None)
+    return user_id == session_b_id
+
+
 async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] = None):
     text = OWNER_TAG
 
@@ -275,35 +285,31 @@ def register_handlers() -> None:
         try:
             if not enabled:
                 return
-            if not m.from_user:
-                return
 
             await ensure_ids()
 
-            if m.from_user.id == session_a_id:
+            logging.warning(
+                "watch_b debug: from_user=%s session_a=%s owner_id=%s session_b=%s text=%r",
+                getattr(m.from_user, "id", None),
+                session_a_id,
+                CONFIG["owner_id"],
+                session_b_id,
+                m.text,
+            )
+
+            # B ကိုယ်တိုင်ပို့တာဆို loop မဖြစ်အောင် skip
+            if is_from_account_b(m):
+                return
+
+            # A / owner ဘက်ကပို့လာရင် B reply -> A reply
+            if is_from_account_a(m):
                 msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
                 if msg_b:
                     await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+                return
+
         except Exception as e:
             logging.warning("watch_b failed: %s", e)
-
-    if CONFIG["enable_two_way"]:
-        @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-        async def watch_a(_, m):
-            try:
-                if not enabled:
-                    return
-                if not m.from_user:
-                    return
-
-                await ensure_ids()
-
-                if m.from_user.id == session_b_id:
-                    msg_a = await send_human(app_a, CONFIG["group_id"], m.id, get_text("a"))
-                    if msg_a:
-                        await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
-            except Exception as e:
-                logging.warning("watch_a failed: %s", e)
 
 
 async def main() -> None:
