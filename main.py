@@ -18,19 +18,10 @@ SESSA_FILE = os.path.join(LOCALES_DIR, "sessa.txt")
 SESSB_FILE = os.path.join(LOCALES_DIR, "sessb.txt")
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
-
 OWNER_TAG = "@Official_Bika"
 
 TRIGGER_EMOJIS = [
-    "💮",
-    "🟡",
-    "🎴",
-    "💈",
-    "💊",
-    "🎞",
-    "✨",
-    "🪞",
-    "⚜️",
+    "💮", "🟡", "🎴", "💈", "💊", "🎞", "✨", "🪞", "⚜️",
 ]
 
 TRIGGER_KEYWORDS = [
@@ -46,6 +37,7 @@ session_b_id = None
 sessa_lines: List[str] = []
 sessb_lines: List[str] = []
 enabled = False
+conversation_task: Optional[asyncio.Task] = None
 CONFIG = {}
 
 
@@ -142,7 +134,6 @@ def normalize_text(text: str) -> str:
         return ""
 
     text = unicodedata.normalize("NFKC", text).lower()
-
     fancy_map = str.maketrans({
         "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ғ": "f",
         "ɢ": "g", "ʜ": "h", "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l",
@@ -150,7 +141,6 @@ def normalize_text(text: str) -> str:
         "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
         "ꜱ": "s",
     })
-
     text = text.translate(fancy_map)
 
     cleaned = []
@@ -169,7 +159,6 @@ def is_spawn_alert_message(m) -> bool:
     raw_content = f"{raw_text}\n{raw_caption}"
 
     has_trigger_emoji = any(emoji in raw_content for emoji in TRIGGER_EMOJIS)
-
     normalized = normalize_text(raw_content)
     has_trigger_keyword = any(keyword in normalized for keyword in TRIGGER_KEYWORDS)
 
@@ -178,14 +167,9 @@ def is_spawn_alert_message(m) -> bool:
 
 async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] = None):
     text = OWNER_TAG
-
     try:
         if reply_to:
-            return await app.send_message(
-                chat_id,
-                text,
-                reply_to_message_id=reply_to,
-            )
+            return await app.send_message(chat_id, text, reply_to_message_id=reply_to)
         return await app.send_message(chat_id, text)
     except Exception as e:
         logging.warning("send_owner_mention failed: %s", e)
@@ -200,11 +184,7 @@ async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: s
 
         if reply_to:
             try:
-                return await app.send_message(
-                    chat_id,
-                    text,
-                    reply_to_message_id=reply_to,
-                )
+                return await app.send_message(chat_id, text, reply_to_message_id=reply_to)
             except Exception as e:
                 logging.warning("reply send failed, fallback to normal message: %s", e)
 
@@ -218,22 +198,33 @@ async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: s
         logging.warning("send_human failed: %s", e)
         return None
 
-async def start_conversation():
-    first_a = await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
-    if not first_a:
-        return
 
-    msg_b = await send_human(app_b, CONFIG["group_id"], first_a.id, get_text("b"))
-    if not msg_b:
-        return
+async def conversation_loop():
+    global enabled
+    try:
+        while enabled:
+            msg_a = await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
+            if not msg_a:
+                await asyncio.sleep(2)
+                continue
 
-    await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+            msg_b = await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
+            if not msg_b:
+                await asyncio.sleep(2)
+                continue
+
+            await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logging.warning("conversation_loop failed: %s", e)
 
 
 def register_handlers() -> None:
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
     async def commands(_, m):
-        global enabled
+        global enabled, conversation_task
         try:
             if not m.from_user:
                 return
@@ -241,22 +232,32 @@ def register_handlers() -> None:
                 return
 
             if m.text == "/open":
-               enabled = True
-               await m.reply("✅ ON")
-               await start_conversation()
-    
+                enabled = True
+                await m.reply("✅ ON")
+
+                if conversation_task and not conversation_task.done():
+                    conversation_task.cancel()
+
+                conversation_task = asyncio.create_task(conversation_loop())
+
             elif m.text == "/close":
                 enabled = False
                 await m.reply("❌ OFF")
 
+                if conversation_task and not conversation_task.done():
+                    conversation_task.cancel()
+
             elif m.text == "/status":
+                running = bool(conversation_task and not conversation_task.done())
                 await m.reply(
                     f"enabled={enabled}\n"
                     f"group_id={CONFIG['group_id']}\n"
+                    f"loop_running={running}"
                 )
 
             elif m.text == "/help":
                 await m.reply("/open\n/close\n/status\n/help")
+
         except Exception as e:
             logging.warning("commands handler failed: %s", e)
 
@@ -266,10 +267,8 @@ def register_handlers() -> None:
             is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
             if not is_bot_message:
                 return
-
             if not is_spawn_alert_message(m):
                 return
-
             await send_owner_mention(app_a, CONFIG["group_id"], m.id)
         except Exception as e:
             logging.warning("detect_spawn_alert_a failed: %s", e)
@@ -280,44 +279,11 @@ def register_handlers() -> None:
             is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
             if not is_bot_message:
                 return
-
             if not is_spawn_alert_message(m):
                 return
-
             await send_owner_mention(app_b, CONFIG["group_id"], m.id)
         except Exception as e:
             logging.warning("detect_spawn_alert_b failed: %s", e)
-
-    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-async def watch_b(_, m):
-    try:
-        if not enabled:
-            return
-
-        await ensure_ids()
-
-        from_id = getattr(m.from_user, "id", None)
-
-        logging.warning(
-            "watch_b debug: from_user=%s session_a=%s session_b=%s text=%r",
-            from_id,
-            session_a_id,
-            session_b_id,
-            m.text,
-        )
-
-        if from_id == session_b_id:
-            return
-
-        if from_id != session_a_id:
-            return
-
-        msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
-        if msg_b:
-            await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
-
-    except Exception as e:
-        logging.warning("watch_b failed: %s", e)
 
 
 async def main() -> None:
@@ -349,12 +315,13 @@ async def main() -> None:
     await app_a.start()
     await app_b.start()
     await ensure_ids()
-
     register_handlers()
 
     try:
         await idle()
     finally:
+        if conversation_task and not conversation_task.done():
+            conversation_task.cancel()
         await app_a.stop()
         await app_b.stop()
 
