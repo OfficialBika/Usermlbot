@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import unicodedata
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -137,13 +138,32 @@ def get_text(which: str) -> str:
     return text
 
 
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+
+    text = unicodedata.normalize("NFKC", text).lower()
+
+    fancy_map = str.maketrans({
+        "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ғ": "f",
+        "ɢ": "g", "ʜ": "h", "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l",
+        "ᴍ": "m", "ɴ": "n", "ᴏ": "o", "ᴘ": "p", "ǫ": "q", "ʀ": "r",
+        "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
+        "ꜱ": "s",
+    })
+
+    return text.translate(fancy_map)
+
+
 def is_spawn_alert_message(m) -> bool:
-    text = (m.text or "").lower()
-    caption = (m.caption or "").lower()
-    content = f"{text}\n{caption}"
+    raw_text = m.text or ""
+    raw_caption = m.caption or ""
+    content = f"{raw_text}\n{raw_caption}"
 
     has_trigger_emoji = any(emoji in content for emoji in TRIGGER_EMOJIS)
-    has_trigger_keyword = any(keyword in content for keyword in TRIGGER_KEYWORDS)
+
+    normalized = normalize_text(content)
+    has_trigger_keyword = any(keyword in normalized for keyword in TRIGGER_KEYWORDS)
 
     return has_trigger_emoji or has_trigger_keyword
 
