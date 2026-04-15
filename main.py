@@ -218,6 +218,17 @@ async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: s
         logging.warning("send_human failed: %s", e)
         return None
 
+async def start_conversation():
+    first_a = await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
+    if not first_a:
+        return
+
+    msg_b = await send_human(app_b, CONFIG["group_id"], first_a.id, get_text("b"))
+    if not msg_b:
+        return
+
+    await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+
 
 def register_handlers() -> None:
     @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.text)
@@ -230,10 +241,10 @@ def register_handlers() -> None:
                 return
 
             if m.text == "/open":
-                enabled = True
-                await m.reply("✅ ON")
-                await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
-
+               enabled = True
+               await m.reply("✅ ON")
+               await start_conversation()
+    
             elif m.text == "/close":
                 enabled = False
                 await m.reply("❌ OFF")
@@ -278,37 +289,35 @@ def register_handlers() -> None:
             logging.warning("detect_spawn_alert_b failed: %s", e)
 
     @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-    async def watch_b(_, m):
-        try:
-            if not enabled:
-                return
-            if not m.from_user:
-                return
+async def watch_b(_, m):
+    try:
+        if not enabled:
+            return
 
-            await ensure_ids()
+        await ensure_ids()
 
-            from_id = getattr(m.from_user, "id", None)
+        from_id = getattr(m.from_user, "id", None)
 
-            logging.warning(
-                "watch_b debug: from_user=%s session_a=%s session_b=%s text=%r",
-                from_id,
-                session_a_id,
-                session_b_id,
-                m.text,
-            )
+        logging.warning(
+            "watch_b debug: from_user=%s session_a=%s session_b=%s text=%r",
+            from_id,
+            session_a_id,
+            session_b_id,
+            m.text,
+        )
 
-            if from_id == session_b_id:
-                return
+        if from_id == session_b_id:
+            return
 
-            if from_id != session_a_id:
-                return
+        if from_id != session_a_id:
+            return
 
-            msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
-            if msg_b:
-                await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+        msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
+        if msg_b:
+            await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
 
-        except Exception as e:
-            logging.warning("watch_b failed: %s", e)
+    except Exception as e:
+        logging.warning("watch_b failed: %s", e)
 
 
 async def main() -> None:
