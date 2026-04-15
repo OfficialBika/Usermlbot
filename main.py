@@ -61,12 +61,19 @@ def getenv_int(name: str, default: int) -> int:
         return default
     return int(value)
 
+def getenv_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
 
 def load_config() -> dict:
     min_delay = getenv_int("MIN_REPLY_DELAY", 2)
     max_delay = getenv_int("MAX_REPLY_DELAY", 4)
     if min_delay > max_delay:
         min_delay, max_delay = max_delay, min_delay
+
+    "reply_chance": getenv_float("REPLY_CHANCE", 0.25),
 
     return {
         "api_id": int(getenv_required("API_ID")),
@@ -176,15 +183,27 @@ async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] 
         return None
 
 
-async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: str):
+async def send_human(
+    app: Client,
+    chat_id: int,
+    reply_to: Optional[int],
+    text: str,
+    force_reply: bool = False,
+):
     try:
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
         await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(random.uniform(2, 4))
 
-        if reply_to:
+        use_reply = bool(reply_to) and (force_reply or random.random() < CONFIG["reply_chance"])
+
+        if use_reply:
             try:
-                return await app.send_message(chat_id, text, reply_to_message_id=reply_to)
+                return await app.send_message(
+                    chat_id,
+                    text,
+                    reply_to_message_id=reply_to,
+                )
             except Exception as e:
                 logging.warning("reply send failed, fallback to normal message: %s", e)
 
