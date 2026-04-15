@@ -83,7 +83,6 @@ def load_config() -> dict:
         "session_b_string": getenv_required("SESSION_B_STRING"),
         "owner_id": int(getenv_required("OWNER_ID")),
         "group_id": int(getenv_required("GROUP_ID")),
-        "enable_two_way": getenv_bool("ENABLE_TWO_WAY", False),
         "min_reply_delay": min_delay,
         "max_reply_delay": max_delay,
         "debug": getenv_bool("DEBUG", False),
@@ -137,8 +136,6 @@ def get_text(which: str) -> str:
         text = random.choice(EMOJIS)
     return text
 
-def get_sender_id(m):
-    return getattr(m.from_user, "id", None)
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -235,8 +232,7 @@ def register_handlers() -> None:
             if m.text == "/open":
                 enabled = True
                 await m.reply("✅ ON")
-                first_text = get_text("a")
-                await send_human(app_a, CONFIG["group_id"], None, first_text)
+                await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
 
             elif m.text == "/close":
                 enabled = False
@@ -246,7 +242,6 @@ def register_handlers() -> None:
                 await m.reply(
                     f"enabled={enabled}\n"
                     f"group_id={CONFIG['group_id']}\n"
-                    f"enable_two_way={CONFIG['enable_two_way']}"
                 )
 
             elif m.text == "/help":
@@ -282,41 +277,40 @@ def register_handlers() -> None:
         except Exception as e:
             logging.warning("detect_spawn_alert_b failed: %s", e)
 
-    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & (filters.text | filters.caption))
-async def watch_b(_, m):
-    try:
-        if not enabled:
-            return
+    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
+    async def watch_b(_, m):
+        try:
+            if not enabled:
+                return
+            if not m.from_user:
+                return
 
-        await ensure_ids()
+            await ensure_ids()
 
-        sender_id = get_sender_id(m)
-        msg_text = m.text or m.caption or ""
+            from_id = getattr(m.from_user, "id", None)
 
-        logging.warning(
-            "watch_b debug: sender_id=%s session_a=%s session_b=%s text=%r",
-            sender_id,
-            session_a_id,
-            session_b_id,
-            msg_text,
-        )
+            logging.warning(
+                "watch_b debug: from_user=%s session_a=%s session_b=%s text=%r",
+                from_id,
+                session_a_id,
+                session_b_id,
+                m.text,
+            )
 
-        # B ကိုယ်တိုင်ပို့တာ skip
-        if sender_id == session_b_id:
-            return
+            if from_id == session_b_id:
+                return
 
-        # A ကပို့တာမှသာ B -> A conversation စ
-        if sender_id != session_a_id:
-            return
+            if from_id != session_a_id:
+                return
 
-        msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
-        if msg_b:
-            await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+            msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
+            if msg_b:
+                await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
 
-    except Exception as e:
-        logging.warning("watch_b failed: %s", e)
+        except Exception as e:
+            logging.warning("watch_b failed: %s", e)
 
-    
+
 async def main() -> None:
     global CONFIG, app_a, app_b, sessa_lines, sessb_lines
 
