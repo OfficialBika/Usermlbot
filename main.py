@@ -30,6 +30,7 @@ TRIGGER_EMOJIS = [
     "✨",
     "🪞",
     "⚜️",
+    "ᴀᴛᴛᴇɴᴛɪᴏɴ",
 ]
 
 app_a: Optional[Client] = None
