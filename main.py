@@ -18,6 +18,20 @@ SESSB_FILE = os.path.join(LOCALES_DIR, "sessb.txt")
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
+OWNER_TAG = "@Official_Bika"
+
+TRIGGER_EMOJIS = [
+    "💮",
+    "🟡",
+    "🎴",
+    "💈",
+    "💊",
+    "🎞",
+    "✨",
+    "🪞",
+    "⚜️",
+]
+
 app_a: Optional[Client] = None
 app_b: Optional[Client] = None
 session_a_id = None
@@ -119,23 +133,15 @@ def get_text(which: str) -> str:
 
 
 def is_spawn_alert_message(m) -> bool:
-    text = (m.text or "").strip().lower()
-    caption = (m.caption or "").strip().lower()
+    text = m.text or ""
+    caption = m.caption or ""
     content = f"{text}\n{caption}"
 
-    triggers = [
-        "💮 ᴀ ᴄʜᴀʀᴀᴄᴛᴇʀ ʜᴀs sᴘᴀᴡɴᴇᴅ ɪɴ ᴛʜᴇ ᴄʜᴀᴛ!🧃",
-        "💈 ᴀᴛᴛᴇɴᴛɪᴏɴ",
-        "ᴀɴ ꜱᴘᴇᴄɪᴀʟ ᴄʜᴀʀᴀᴄᴛᴇʀ ɪꜱ ᴀʙᴏᴜᴛ ᴛᴏ ꜱᴘᴀᴡɴ",
-        "ꜱᴏʟᴠᴇ ᴛʜᴇ ᴄᴀᴘᴛᴄʜᴀ ɪɴ 60 ꜱᴇᴄᴏɴᴅꜱ",
-    ]
-
-    return any(trigger in content for trigger in triggers)
+    return any(emoji in content for emoji in TRIGGER_EMOJIS)
 
 
 async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] = None):
-    owner_mention = f'<a href="tg://user?id={CONFIG["owner_id"]}">Owner</a>'
-    text = f"{owner_mention} spawn alert!"
+    text = OWNER_TAG
 
     try:
         if reply_to:
@@ -143,13 +149,8 @@ async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] 
                 chat_id,
                 text,
                 reply_to_message_id=reply_to,
-                parse_mode="html",
             )
-        return await app.send_message(
-            chat_id,
-            text,
-            parse_mode="html",
-        )
+        return await app.send_message(chat_id, text)
     except Exception as e:
         logging.warning("send_owner_mention failed: %s", e)
         return None
@@ -211,7 +212,7 @@ def register_handlers() -> None:
             logging.warning("commands handler failed: %s", e)
 
     @app_a.on_message(filters.chat(CONFIG["group_id"]))
-    async def detect_spawn_alert(_, m):
+    async def detect_spawn_alert_a(_, m):
         try:
             is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
 
@@ -223,7 +224,22 @@ def register_handlers() -> None:
 
             await send_owner_mention(app_a, CONFIG["group_id"], m.id)
         except Exception as e:
-            logging.warning("detect_spawn_alert failed: %s", e)
+            logging.warning("detect_spawn_alert_a failed: %s", e)
+
+    @app_b.on_message(filters.chat(CONFIG["group_id"]))
+    async def detect_spawn_alert_b(_, m):
+        try:
+            is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
+
+            if not is_bot_message:
+                return
+
+            if not is_spawn_alert_message(m):
+                return
+
+            await send_owner_mention(app_b, CONFIG["group_id"], m.id)
+        except Exception as e:
+            logging.warning("detect_spawn_alert_b failed: %s", e)
 
     @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
     async def watch_b(_, m):
