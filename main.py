@@ -124,10 +124,10 @@ def is_spawn_alert_message(m) -> bool:
     content = f"{text}\n{caption}"
 
     triggers = [
-        "a character has spawned in the chat",
-        "add this character to your harem using /catch",
-        "a special character is about to spawn",
-        "solve the captcha in 60 seconds",
+        "💮 ᴀ ᴄʜᴀʀᴀᴄᴛᴇʀ ʜᴀs sᴘᴀᴡɴᴇᴅ ɪɴ ᴛʜᴇ ᴄʜᴀᴛ!🧃",
+        "💈 ᴀᴛᴛᴇɴᴛɪᴏɴ",
+        "ᴀɴ ꜱᴘᴇᴄɪᴀʟ ᴄʜᴀʀᴀᴄᴛᴇʀ ɪꜱ ᴀʙᴏᴜᴛ ᴛᴏ ꜱᴘᴀᴡɴ",
+        "ꜱᴏʟᴠᴇ ᴛʜᴇ ᴄᴀᴘᴛᴄʜᴀ ɪɴ 60 ꜱᴇᴄᴏɴᴅꜱ",
     ]
 
     return any(trigger in content for trigger in triggers)
