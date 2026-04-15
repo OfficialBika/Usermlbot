@@ -152,30 +152,29 @@ def normalize_text(text: str) -> str:
         "ꜱ": "s",
     })
 
-    return text.translate(fancy_map)
+    text = text.translate(fancy_map)
+
+    cleaned = []
+    for ch in text:
+        if ch.isalnum() or ch.isspace():
+            cleaned.append(ch)
+        else:
+            cleaned.append(" ")
+
+    return " ".join("".join(cleaned).split())
 
 
 def is_spawn_alert_message(m) -> bool:
     raw_text = m.text or ""
     raw_caption = m.caption or ""
-    content = f"{raw_text}\n{raw_caption}"
+    raw_content = f"{raw_text}\n{raw_caption}"
 
-    has_trigger_emoji = any(emoji in content for emoji in TRIGGER_EMOJIS)
+    has_trigger_emoji = any(emoji in raw_content for emoji in TRIGGER_EMOJIS)
 
-    normalized = normalize_text(content)
+    normalized = normalize_text(raw_content)
     has_trigger_keyword = any(keyword in normalized for keyword in TRIGGER_KEYWORDS)
 
     return has_trigger_emoji or has_trigger_keyword
-
-
-def is_from_account_a(m) -> bool:
-    user_id = getattr(m.from_user, "id", None)
-    return user_id in {session_a_id, CONFIG["owner_id"]}
-
-
-def is_from_account_b(m) -> bool:
-    user_id = getattr(m.from_user, "id", None)
-    return user_id == session_b_id
 
 
 async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] = None):
@@ -234,7 +233,8 @@ def register_handlers() -> None:
             if m.text == "/open":
                 enabled = True
                 await m.reply("✅ ON")
-                await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
+                first_text = get_text("a")
+                await send_human(app_a, CONFIG["group_id"], None, first_text)
 
             elif m.text == "/close":
                 enabled = False
@@ -285,31 +285,36 @@ def register_handlers() -> None:
         try:
             if not enabled:
                 return
+            if not m.from_user:
+                return
 
             await ensure_ids()
 
-            logging.warning(
-                "watch_b debug: from_user=%s session_a=%s owner_id=%s session_b=%s text=%r",
-                getattr(m.from_user, "id", None),
-                session_a_id,
-                CONFIG["owner_id"],
-                session_b_id,
-                m.text,
-            )
-
-            # B ကိုယ်တိုင်ပို့တာဆို loop မဖြစ်အောင် skip
-            if is_from_account_b(m):
-                return
-
-            # A / owner ဘက်ကပို့လာရင် B reply -> A reply
-            if is_from_account_a(m):
+            if m.from_user.id == session_a_id:
                 msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
                 if msg_b:
                     await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
-                return
 
         except Exception as e:
             logging.warning("watch_b failed: %s", e)
+
+    if CONFIG["enable_two_way"]:
+        @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
+        async def watch_a(_, m):
+            try:
+                if not enabled:
+                    return
+                if not m.from_user:
+                    return
+
+                await ensure_ids()
+
+                if m.from_user.id == session_b_id:
+                    msg_a = await send_human(app_a, CONFIG["group_id"], m.id, get_text("a"))
+                    if msg_a:
+                        await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
+            except Exception as e:
+                logging.warning("watch_a failed: %s", e)
 
 
 async def main() -> None:
