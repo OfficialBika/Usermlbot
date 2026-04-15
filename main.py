@@ -137,6 +137,8 @@ def get_text(which: str) -> str:
         text = random.choice(EMOJIS)
     return text
 
+def get_sender_id(m):
+    return getattr(m.from_user, "id", None)
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -280,43 +282,41 @@ def register_handlers() -> None:
         except Exception as e:
             logging.warning("detect_spawn_alert_b failed: %s", e)
 
-    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-    async def watch_b(_, m):
-        try:
-            if not enabled:
-                return
-            if not m.from_user:
-                return
+    @app_b.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & (filters.text | filters.caption))
+async def watch_b(_, m):
+    try:
+        if not enabled:
+            return
 
-            await ensure_ids()
+        await ensure_ids()
 
-            if m.from_user.id == session_a_id:
-                msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
-                if msg_b:
-                    await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
+        sender_id = get_sender_id(m)
+        msg_text = m.text or m.caption or ""
 
-        except Exception as e:
-            logging.warning("watch_b failed: %s", e)
+        logging.warning(
+            "watch_b debug: sender_id=%s session_a=%s session_b=%s text=%r",
+            sender_id,
+            session_a_id,
+            session_b_id,
+            msg_text,
+        )
 
-    if CONFIG["enable_two_way"]:
-        @app_a.on_message(filters.chat(CONFIG["group_id"]) & filters.incoming & filters.text)
-        async def watch_a(_, m):
-            try:
-                if not enabled:
-                    return
-                if not m.from_user:
-                    return
+        # B ကိုယ်တိုင်ပို့တာ skip
+        if sender_id == session_b_id:
+            return
 
-                await ensure_ids()
+        # A ကပို့တာမှသာ B -> A conversation စ
+        if sender_id != session_a_id:
+            return
 
-                if m.from_user.id == session_b_id:
-                    msg_a = await send_human(app_a, CONFIG["group_id"], m.id, get_text("a"))
-                    if msg_a:
-                        await send_human(app_b, CONFIG["group_id"], msg_a.id, get_text("b"))
-            except Exception as e:
-                logging.warning("watch_a failed: %s", e)
+        msg_b = await send_human(app_b, CONFIG["group_id"], m.id, get_text("b"))
+        if msg_b:
+            await send_human(app_a, CONFIG["group_id"], msg_b.id, get_text("a"))
 
+    except Exception as e:
+        logging.warning("watch_b failed: %s", e)
 
+    
 async def main() -> None:
     global CONFIG, app_a, app_b, sessa_lines, sessb_lines
 
