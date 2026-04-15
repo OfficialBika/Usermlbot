@@ -30,7 +30,12 @@ TRIGGER_EMOJIS = [
     "✨",
     "🪞",
     "⚜️",
-    "ᴀᴛᴛᴇɴᴛɪᴏɴ",
+]
+
+TRIGGER_KEYWORDS = [
+    "captcha",
+    "attention",
+    "special",
 ]
 
 app_a: Optional[Client] = None
@@ -91,7 +96,6 @@ def setup_logging(debug: bool) -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         force=True,
     )
-
     logging.getLogger().setLevel(level)
     logging.getLogger("pyrogram").setLevel(logging.CRITICAL)
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
@@ -134,11 +138,14 @@ def get_text(which: str) -> str:
 
 
 def is_spawn_alert_message(m) -> bool:
-    text = m.text or ""
-    caption = m.caption or ""
+    text = (m.text or "").lower()
+    caption = (m.caption or "").lower()
     content = f"{text}\n{caption}"
 
-    return any(emoji in content for emoji in TRIGGER_EMOJIS)
+    has_trigger_emoji = any(emoji in content for emoji in TRIGGER_EMOJIS)
+    has_trigger_keyword = any(keyword in content for keyword in TRIGGER_KEYWORDS)
+
+    return has_trigger_emoji or has_trigger_keyword
 
 
 async def send_owner_mention(app: Client, chat_id: int, reply_to: Optional[int] = None):
@@ -165,7 +172,11 @@ async def send_human(app: Client, chat_id: int, reply_to: Optional[int], text: s
 
         if reply_to:
             try:
-                return await app.send_message(chat_id, text, reply_to_message_id=reply_to)
+                return await app.send_message(
+                    chat_id,
+                    text,
+                    reply_to_message_id=reply_to,
+                )
             except Exception as e:
                 logging.warning("reply send failed, fallback to normal message: %s", e)
 
@@ -193,8 +204,7 @@ def register_handlers() -> None:
             if m.text == "/open":
                 enabled = True
                 await m.reply("✅ ON")
-                first_text = get_text("a")
-                await send_human(app_a, CONFIG["group_id"], None, first_text)
+                await send_human(app_a, CONFIG["group_id"], None, get_text("a"))
 
             elif m.text == "/close":
                 enabled = False
@@ -216,7 +226,6 @@ def register_handlers() -> None:
     async def detect_spawn_alert_a(_, m):
         try:
             is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
-
             if not is_bot_message:
                 return
 
@@ -231,7 +240,6 @@ def register_handlers() -> None:
     async def detect_spawn_alert_b(_, m):
         try:
             is_bot_message = bool((m.from_user and m.from_user.is_bot) or m.sender_chat)
-
             if not is_bot_message:
                 return
 
