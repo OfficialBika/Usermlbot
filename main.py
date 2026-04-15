@@ -192,7 +192,7 @@ async def send_human(
     try:
         await asyncio.sleep(random.uniform(CONFIG["min_reply_delay"], CONFIG["max_reply_delay"]))
         await app.send_chat_action(chat_id, ChatAction.TYPING)
-        await asyncio.sleep(random.uniform(2, 4))
+        await asyncio.sleep(random.uniform(0.3, 0.8))
 
         use_reply = bool(reply_to) and (force_reply or random.random() < CONFIG["reply_chance"])
 
@@ -215,7 +215,6 @@ async def send_human(
     except Exception as e:
         logging.warning("send_human failed: %s", e)
         return None
-
 
 async def conversation_loop():
     global enabled
