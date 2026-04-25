@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import time
 import unicodedata
 from typing import List, Optional, Set, Tuple
@@ -11,7 +12,8 @@ from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatAction
 from pyrogram.errors import FloodWait
 
-load_dotenv()
+# Important for PM2 / old environment cache
+load_dotenv(override=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCALES_DIR = os.path.join(BASE_DIR, "locales")
@@ -43,11 +45,9 @@ sessb_lines: List[str] = []
 
 CONFIG = {}
 
-# Multi-group state
 enabled_groups: Set[int] = set()
 conversation_tasks: dict[int, asyncio.Task] = {}
 
-# Spawn alert duplicate protection
 alert_seen: dict[Tuple[int, int], float] = {}
 alert_seen_lock = asyncio.Lock()
 ALERT_DEDUPE_TTL_SECONDS = 180
@@ -81,10 +81,46 @@ def getenv_float(name: str, default: float) -> float:
     return float(value.strip())
 
 
+def clean_session_string(value: str, name: str) -> str:
+    """
+    Fix common .env copy/paste issues:
+    - surrounding quotes
+    - spaces
+    - new lines
+    - invisible whitespace
+    """
+    if value is None:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+
+    s = value.strip()
+
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # Remove all whitespace inside copied session string
+    s = re.sub(r"\s+", "", s)
+
+    if not s:
+        raise RuntimeError(f"{name} is empty after cleaning")
+
+    bad_chars = [ch for ch in s if not (ch.isalnum() or ch in "-_=")]
+    if bad_chars:
+        sample = "".join(bad_chars[:10])
+        raise RuntimeError(
+            f"{name} contains invalid characters: {sample!r}. "
+            f"Please paste a valid Pyrogram session string."
+        )
+
+    return s
+
+
+def getenv_session(name: str) -> str:
+    return clean_session_string(getenv_required(name), name)
+
+
 def parse_int_set(raw: str, env_name: str) -> Set[int]:
     result: Set[int] = set()
 
-    # Allow comma/newline separated values
     raw = raw.replace("\n", ",")
     parts = raw.split(",")
 
@@ -108,10 +144,6 @@ def parse_int_set(raw: str, env_name: str) -> Set[int]:
 
 
 def getenv_int_set(primary_name: str, fallback_name: str) -> Set[int]:
-    """
-    Prefer OWNER_IDS / GROUP_IDS.
-    Fallback to old OWNER_ID / GROUP_ID for backward compatibility.
-    """
     raw = os.getenv(primary_name)
     used_name = primary_name
 
@@ -121,8 +153,7 @@ def getenv_int_set(primary_name: str, fallback_name: str) -> Set[int]:
 
     if raw is None or raw.strip() == "":
         raise RuntimeError(
-            f"Missing required environment variable: {primary_name} "
-            f"or {fallback_name}"
+            f"Missing required environment variable: {primary_name} or {fallback_name}"
         )
 
     return parse_int_set(raw, used_name)
@@ -145,13 +176,10 @@ def load_config() -> dict:
     return {
         "api_id": int(getenv_required("API_ID")),
         "api_hash": getenv_required("API_HASH"),
-        "session_a_string": getenv_required("SESSION_A_STRING"),
-        "session_b_string": getenv_required("SESSION_B_STRING"),
-
-        # New multi value envs
+        "session_a_string": getenv_session("SESSION_A_STRING"),
+        "session_b_string": getenv_session("SESSION_B_STRING"),
         "owner_ids": getenv_int_set("OWNER_IDS", "OWNER_ID"),
         "group_ids": getenv_int_set("GROUP_IDS", "GROUP_ID"),
-
         "owner_tag": owner_tag,
         "min_reply_delay": min_delay,
         "max_reply_delay": max_delay,
@@ -263,10 +291,6 @@ def is_spawn_alert_message(m) -> bool:
 
 
 async def mark_alert_seen(chat_id: int, message_id: int) -> bool:
-    """
-    Return True only for first detector.
-    This prevents app_a and app_b from mentioning owner twice for same alert.
-    """
     now = time.monotonic()
     key = (chat_id, message_id)
 
@@ -435,10 +459,6 @@ def format_id_list(ids: Set[int]) -> str:
 
 
 async def start_group_loop(group_id: int) -> bool:
-    """
-    Return True if newly started.
-    Return False if already running.
-    """
     enabled_groups.add(group_id)
 
     old_task = conversation_tasks.get(group_id)
@@ -450,10 +470,6 @@ async def start_group_loop(group_id: int) -> bool:
 
 
 async def stop_group_loop(group_id: int) -> bool:
-    """
-    Return True if stopped.
-    Return False if it was already off.
-    """
     was_enabled = group_id in enabled_groups
     enabled_groups.discard(group_id)
 
@@ -587,13 +603,15 @@ def register_handlers() -> None:
 
 async def shutdown_clients() -> None:
     for gid in list(enabled_groups):
-        await stop_group_loop(gid)
+        enabled_groups.discard(gid)
 
     tasks = [
         task
         for task in conversation_tasks.values()
         if task and not task.done()
     ]
+
+    conversation_tasks.clear()
 
     for task in tasks:
         task.cancel()
@@ -628,6 +646,7 @@ async def main() -> None:
         api_id=CONFIG["api_id"],
         api_hash=CONFIG["api_hash"],
         session_string=CONFIG["session_a_string"],
+        in_memory=True,
     )
 
     app_b = Client(
@@ -635,6 +654,7 @@ async def main() -> None:
         api_id=CONFIG["api_id"],
         api_hash=CONFIG["api_hash"],
         session_string=CONFIG["session_b_string"],
+        in_memory=True,
     )
 
     await app_a.start()
@@ -642,6 +662,13 @@ async def main() -> None:
 
     await ensure_ids()
     register_handlers()
+
+    logging.warning(
+        "Started successfully | session_a_id=%s | session_b_id=%s | groups=%s",
+        session_a_id,
+        session_b_id,
+        format_id_list(CONFIG["group_ids"]),
+    )
 
     try:
         await idle()
