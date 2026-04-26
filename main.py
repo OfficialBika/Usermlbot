@@ -755,6 +755,12 @@ async def ensure_ids() -> None:
     if session_b_id is None:
         session_b_id = (await app_b.get_me()).id
 
+async def warmup_peer_cache(app: Client) -> None:
+    try:
+        async for _ in app.get_dialogs(limit=100):
+            pass
+    except Exception as e:
+        logging.warning("warmup_peer_cache failed: %s", e)
 
 def get_text(which: str) -> str:
     pool = sessa_lines if which == "a" else sessb_lines
@@ -2103,6 +2109,10 @@ async def main() -> None:
     await app_b.start()
 
     await ensure_ids()
+
+    await warmup_peer_cache(app_a)
+    await warmup_peer_cache(app_b)
+
     register_handlers()
 
     start_active_timer()
