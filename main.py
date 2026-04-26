@@ -40,7 +40,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@Official_Bika"
+DEFAULT_OWNER_TAG = "@BikaSec"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
