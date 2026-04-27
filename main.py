@@ -40,7 +40,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@Bikasec"
+DEFAULT_OWNER_TAG = "@Official_Bika"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
@@ -1308,7 +1308,9 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
     if not responder_bot_id:
         return
 
-    if m.chat.type != ChatType.PRIVATE:
+    # Pyrogram may report a DM with a bot as ChatType.BOT, not ChatType.PRIVATE.
+    # If we only accept PRIVATE, responder bot replies are ignored silently.
+    if m.chat and m.chat.type not in {ChatType.PRIVATE, ChatType.BOT}:
         return
 
     if not m.from_user or m.from_user.id != responder_bot_id:
