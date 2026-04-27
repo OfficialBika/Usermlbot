@@ -866,8 +866,96 @@ def extract_catch_command(response_text: str) -> Optional[str]:
 
     return None
 
-def extract_catch_command_from_buttons(m) -> Optional[str]:
-    """Try to read /catch from inline keyboard/copy-text buttons when text parsing fails."""
+def _object_to_strings(obj, *, max_depth: int = 4, _seen: Optional[set[int]] = None) -> list[str]:
+    """
+    Safely collect text fields from Pyrogram/raw button objects.
+    CopyTextButton payload can be exposed differently depending on Pyrogram/Telegram layer:
+    btn.copy_text.text, raw text field, __dict__, or repr().
+    """
+    if obj is None:
+        return []
+
+    if _seen is None:
+        _seen = set()
+
+    oid = id(obj)
+    if oid in _seen or max_depth < 0:
+        return []
+    _seen.add(oid)
+
+    if isinstance(obj, (str, bytes, int, float, bool)):
+        if isinstance(obj, bytes):
+            try:
+                return [obj.decode("utf-8", errors="ignore")]
+            except Exception:
+                return []
+        return [str(obj)]
+
+    values: list[str] = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            values.extend(_object_to_strings(k, max_depth=max_depth - 1, _seen=_seen))
+            values.extend(_object_to_strings(v, max_depth=max_depth - 1, _seen=_seen))
+        return values
+
+    if isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            values.extend(_object_to_strings(item, max_depth=max_depth - 1, _seen=_seen))
+        return values
+
+    try:
+        d = getattr(obj, "__dict__", None)
+        if isinstance(d, dict):
+            values.extend(_object_to_strings(d, max_depth=max_depth - 1, _seen=_seen))
+    except Exception:
+        pass
+
+    for attr in (
+        "text", "copy_text", "copyText", "copy_text_text", "button", "buttons",
+        "data", "url", "query", "same_peer", "placeholder",
+    ):
+        try:
+            v = getattr(obj, attr, None)
+        except Exception:
+            v = None
+        if v is not None:
+            values.extend(_object_to_strings(v, max_depth=max_depth - 1, _seen=_seen))
+
+    try:
+        values.append(repr(obj))
+    except Exception:
+        pass
+
+    return values
+
+
+def _button_visible_text(btn) -> str:
+    try:
+        return strip_invisible(str(getattr(btn, "text", "") or ""))
+    except Exception:
+        return ""
+
+
+def _is_copy_hint_button(btn) -> bool:
+    text = normalize_text(_button_visible_text(btn))
+    # Examples: "📋 Copy Hint", "Copy Hint", "hint"
+    return "hint" in text and ("copy" in text or text.strip() == "hint")
+
+
+def extract_catch_command_from_copy_hint_button(m) -> Optional[str]:
+    """
+    ONLY read the command from the Copy Hint inline button.
+
+    Requested behavior:
+      - Do NOT use message text.
+      - Do NOT use Full line/button.
+      - Find button whose visible text contains 'Copy Hint'.
+      - Read that button's copy_text payload and send only that value.
+
+    If the current Pyrogram layer cannot expose CopyTextButton payload,
+    this returns None and debug_copy_hint_buttons() will show it.
+    """
     try:
         markup = getattr(m, "reply_markup", None)
         keyboard = getattr(markup, "inline_keyboard", None)
@@ -876,27 +964,62 @@ def extract_catch_command_from_buttons(m) -> Optional[str]:
 
         for row in keyboard:
             for btn in row:
-                values = []
-                for attr in ("text", "url", "callback_data"):
-                    value = getattr(btn, attr, None)
-                    if value:
-                        values.append(str(value))
+                if not _is_copy_hint_button(btn):
+                    continue
 
-                copy_text = getattr(btn, "copy_text", None)
-                if copy_text:
-                    values.append(str(copy_text))
-                    value = getattr(copy_text, "text", None)
-                    if value:
-                        values.append(str(value))
+                candidate_objects = []
+                for attr in ("copy_text", "copyText"):
+                    try:
+                        v = getattr(btn, attr, None)
+                    except Exception:
+                        v = None
+                    if v is not None:
+                        candidate_objects.append(v)
 
-                for value in values:
-                    cmd = extract_catch_command(value)
-                    if cmd:
-                        return cmd
+                # Still only inside the Copy Hint button object.
+                candidate_objects.append(btn)
+
+                for obj in candidate_objects:
+                    for value in _object_to_strings(obj):
+                        cmd = extract_catch_command(value)
+                        if cmd:
+                            return cmd
     except Exception as e:
-        logging.warning("extract_catch_command_from_buttons failed: %s", e)
+        logging.warning("extract_catch_command_from_copy_hint_button failed: %s", e)
 
     return None
+
+
+def debug_copy_hint_buttons(m) -> str:
+    """Short debug summary for Copy Hint button availability."""
+    try:
+        markup = getattr(m, "reply_markup", None)
+        keyboard = getattr(markup, "inline_keyboard", None)
+        if not keyboard:
+            return "NO_INLINE_KEYBOARD"
+
+        lines: list[str] = []
+        for r_idx, row in enumerate(keyboard):
+            for c_idx, btn in enumerate(row):
+                visible = _button_visible_text(btn)
+                if not _is_copy_hint_button(btn):
+                    continue
+                strings = _object_to_strings(btn, max_depth=3)
+                preview_values = []
+                for s in strings:
+                    if "/catch" in s or "catch" in s.lower() or "hint" in s.lower():
+                        s = re.sub(r"\s+", " ", s).strip()
+                        preview_values.append(s[:160])
+                preview = " | ".join(preview_values[:4]) or "COPY_HINT_FOUND_BUT_NO_TEXT_PAYLOAD"
+                lines.append(f"row={r_idx} col={c_idx} text={visible!r} data={preview}")
+        return "\n".join(lines) if lines else "NO_COPY_HINT_BUTTON"
+    except Exception as e:
+        return f"DEBUG_BUTTON_ERROR: {e}"
+
+
+# Backward-compatible name. From now on this intentionally checks Copy Hint only.
+def extract_catch_command_from_buttons(m) -> Optional[str]:
+    return extract_catch_command_from_copy_hint_button(m)
 
 
 def is_success_message(message_text: str) -> bool:
@@ -1525,9 +1648,8 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
         is_bot_sender = bool(m.from_user and m.from_user.is_bot)
 
         response_text = get_responder_message_text(m)
-        catch_command = extract_catch_command(response_text)
-        if not catch_command:
-            catch_command = extract_catch_command_from_buttons(m)
+        # Copy Hint only mode: do not parse message text or Full line anymore.
+        catch_command = extract_catch_command_from_copy_hint_button(m)
 
         # Waifu Cheat Bot can reply slowly. Sometimes the first DM event is empty,
         # then the bot edits it or sends another message with NAME / Hint / Full.
@@ -1565,9 +1687,8 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                                 continue
 
                             candidate_text = get_responder_message_text(candidate)
-                            candidate_command = extract_catch_command(candidate_text)
-                            if not candidate_command:
-                                candidate_command = extract_catch_command_from_buttons(candidate)
+                            # Copy Hint only mode: do not parse message text or Full line anymore.
+                            candidate_command = extract_catch_command_from_copy_hint_button(candidate)
 
                             if candidate_command:
                                 m = candidate
@@ -1581,7 +1702,8 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                         await send_log(
                             "🔁 <b>Delayed responder command found</b>\n"
                             f"Session: <code>{html.escape(session_key)}</code>\n"
-                            f"Command: <code>{html.escape(catch_command)}</code>",
+                            f"Command: <code>{html.escape(catch_command)}</code>\n"
+                            f"Source: <code>Copy Hint button</code>",
                             parse_html=True,
                             app=app,
                         )
@@ -1598,7 +1720,8 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                 f"From: <code>{html.escape(str(sender_id))}</code>\n"
                 f"Known responder: <code>{html.escape(str(is_known_responder))}</code>\n"
                 f"Command: <code>{html.escape(str(catch_command or 'NOT_FOUND'))}</code>\n"
-                f"Text:\n<code>{html.escape((response_text or '')[:700])}</code>",
+                f"Copy Hint Button:\n<code>{html.escape(debug_copy_hint_buttons(m)[:900])}</code>\n"
+                f"Text ignored intentionally. Copy Hint only mode is active.",
                 parse_html=True,
                 app=app,
             )
