@@ -739,20 +739,70 @@ def extract_character_name_from_message(message_text: str) -> Optional[str]:
     return None
 
 
+def strip_invisible(text: str) -> str:
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", text)
+    return text
+
+
+def clean_catch_command(cmd: str) -> str:
+    cmd = strip_invisible(cmd)
+    cmd = cmd.replace("`", "").replace("<code>", "").replace("</code>", "")
+    cmd = re.sub(r"\s+", " ", cmd).strip()
+
+    # Stop at button/footer/noise lines if accidentally captured
+    cmd = re.split(
+        r"\s+(?:Full|Powered|Copy|Official|Hint)\b",
+        cmd,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+
+    if not cmd.lower().startswith("/catch"):
+        return ""
+
+    return cmd
+
+
 def extract_catch_command(response_text: str) -> Optional[str]:
+    """
+    Robustly extract catch command from responder bot reply.
+    Supports:
+    ❤️ Hint: /catch Douma
+    Hint : /catch Douma
+    Hint：/catch Douma
+    Full: /catch Name [Extra]
+    Any fallback /catch line
+    """
+    text = strip_invisible(response_text or "")
+    if not text:
+        return None
+
+    # Normalize colon variants but keep original command casing/name
+    text = (
+        text.replace("：", ":")
+        .replace("﹕", ":")
+        .replace("꞉", ":")
+        .replace("：", ":")
+    )
+
+    # Prefer Hint line
     patterns = [
-        r"Hint\s*[:：]\s*(/catch\s+[^\n]+)",
-        r"Full\s*[:：]\s*(/catch\s+[^\n]+)",
-        r"(/catch\s+[^\n]+)",
+        r"(?:^|\n).*?Hint\s*:\s*(/catch[^\n\r]+)",
+        r"(?:^|\n).*?Full\s*:\s*(/catch[^\n\r]+)",
+        r"(/catch[^\n\r]+)",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, response_text or "", re.IGNORECASE)
+        match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            return " ".join(match.group(1).strip().split())
+            cmd = clean_catch_command(match.group(1))
+            if cmd:
+                return cmd
 
     return None
-
 
 def is_success_message(message_text: str) -> bool:
     normalized = normalize_text(message_text)
