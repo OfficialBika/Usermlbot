@@ -321,11 +321,12 @@ def load_config() -> dict:
         "auto_forward_enabled": auto_forward_enabled,
         "auto_group_enabled_default": getenv_bool("AUTO_GROUPS_ENABLED_BY_DEFAULT", False),
         "bot_id": bot_id,
+        "source_bot_strict": getenv_bool("SOURCE_BOT_STRICT", getenv_bool("BOT_ID_STRICT", True)),
         "responder_bot_id": responder_bot_id or (next(iter(responder_bot_ids)) if responder_bot_ids else None),
         "responder_bot_ids": responder_bot_ids,
         "debug_responder": getenv_bool("DEBUG_RESPONDER", True),
         "log_group_id": log_group_id,
-        "auto_catch_sessions": parse_session_keys(os.getenv("AUTO_CATCH_SESSIONS", "a"), "a"),
+        "auto_catch_sessions": parse_session_keys(os.getenv("AUTO_CATCH_SESSIONS", "a,b"), "a"),
         "success_name": os.getenv("SUCCESS_NAME", "").strip(),
         "catch_min_delay": catch_min_delay,
         "catch_max_delay": catch_max_delay,
@@ -337,7 +338,7 @@ def load_config() -> dict:
         "captcha_solver_enabled": getenv_bool("CAPTCHA_SOLVER_ENABLED", False),
         "captcha_bot_id": getenv_optional_int("CAPTCHA_BOT_ID", default=bot_id),
         "captcha_target_groups": getenv_int_set("CAPTCHA_TARGET_GROUPS", "GROUP_IDS") if (os.getenv("CAPTCHA_TARGET_GROUPS") or "").strip() else group_ids,
-        "captcha_solver_sessions": parse_session_keys(os.getenv("CAPTCHA_SOLVER_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a")), "a"),
+        "captcha_solver_sessions": parse_session_keys(os.getenv("CAPTCHA_SOLVER_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a,b")), "a"),
         "captcha_auto_approve": getenv_bool("CAPTCHA_AUTO_APPROVE", False),
         "captcha_auto_approve_methods": {
             x.strip()
@@ -358,7 +359,7 @@ def load_config() -> dict:
         "direct_db_mongo_uri": os.getenv("DIRECT_DB_MONGO_URI", os.getenv("MONGO_URI", "")).strip(),
         "direct_db_name": os.getenv("DIRECT_DB_NAME", os.getenv("DB_NAME", "")).strip(),
         "direct_db_collection": os.getenv("DIRECT_DB_COLLECTION", os.getenv("MEDIA_COLLECTION", "items")).strip() or "items",
-        "direct_db_sessions": parse_session_keys(os.getenv("DIRECT_DB_CATCH_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a")), "a"),
+        "direct_db_sessions": parse_session_keys(os.getenv("DIRECT_DB_CATCH_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a,b")), "a"),
         "direct_db_command_name": os.getenv("DIRECT_DB_COMMAND_NAME", "/catch").strip() or "/catch",
         "direct_db_source_bot_key": os.getenv("DIRECT_DB_SOURCE_BOT_KEY", "catcher").strip() or "catcher",
         "direct_db_use_file_unique_id": getenv_bool("DIRECT_DB_USE_FILE_UNIQUE_ID", True),
@@ -1449,15 +1450,9 @@ async def init_direct_db() -> None:
         await direct_mongo_client.admin.command("ping")
         direct_items_collection = direct_mongo_client[db_name][collection_name]
 
-        # Helpful indexes. Creating existing indexes is safe.
-        try:
-            await direct_items_collection.create_index("file_unique_id")
-            await direct_items_collection.create_index("sha256")
-            await direct_items_collection.create_index("phash")
-            await direct_items_collection.create_index([("command_name", 1), ("source_bot_key", 1)])
-        except Exception as idx_error:
-            logging.debug("direct db index create skipped/failed: %s", idx_error)
-
+        # MongoDB is intentionally READ-ONLY here.
+        # Do NOT create indexes or write any document/metadata from this userbot.
+        # Use MongoDB Atlas/index management manually outside this bot if indexes are needed.
         await send_log(
             "✅ <b>Direct DB catch connected</b>\n"
             f"DB: <code>{html.escape(db_name)}</code>\n"
@@ -1588,7 +1583,7 @@ def build_direct_catch_command(doc: dict[str, Any]) -> Optional[str]:
 async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optional[str], group_name: str) -> bool:
     if not CONFIG.get("direct_db_catch_enabled"):
         return False
-    if session_key not in CONFIG.get("direct_db_sessions", {"a"}):
+    if session_key not in CONFIG.get("direct_db_sessions", {"a", "b"}):
         return False
 
     doc, method = await direct_db_find_item(app, m)
@@ -1674,11 +1669,84 @@ async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optio
         await send_log(f"❌ Direct DB catch send error: <code>{html.escape(str(e))}</code>", parse_html=True, app=app)
         return True
 
+
+
+def get_message_sender_candidates(m) -> list[int]:
+    """Return all sender-like ids Pyrogram may expose for bot/channel/forwarded posts."""
+    ids: list[int] = []
+
+    try:
+        if getattr(m, "from_user", None) and m.from_user.id is not None:
+            ids.append(int(m.from_user.id))
+    except Exception:
+        pass
+
+    try:
+        if getattr(m, "sender_chat", None) and m.sender_chat.id is not None:
+            ids.append(int(m.sender_chat.id))
+    except Exception:
+        pass
+
+    try:
+        if getattr(m, "forward_from", None) and m.forward_from.id is not None:
+            ids.append(int(m.forward_from.id))
+    except Exception:
+        pass
+
+    try:
+        if getattr(m, "forward_from_chat", None) and m.forward_from_chat.id is not None:
+            ids.append(int(m.forward_from_chat.id))
+    except Exception:
+        pass
+
+    seen: set[int] = set()
+    out: list[int] = []
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def is_source_bot_message(m) -> bool:
+    bot_id = CONFIG.get("bot_id")
+    if not bot_id:
+        return False
+
+    if not CONFIG.get("source_bot_strict", True):
+        return bool((getattr(m, "from_user", None) and m.from_user.is_bot) or getattr(m, "sender_chat", None))
+
+    return int(bot_id) in get_message_sender_candidates(m)
+
+
+async def log_auto_skip_debug(app: Client, session_key: str, m, reason: str, extra: str = "") -> None:
+    if not CONFIG.get("direct_db_debug", True):
+        return
+    try:
+        text = get_message_text(m)
+        if not is_character_spawn_text(text):
+            return
+        sender_ids = ",".join(str(x) for x in get_message_sender_candidates(m)) or "NONE"
+        await send_log(
+            "🧪 <b>Auto catch skipped</b>\n"
+            f"Reason: <code>{html.escape(reason)}</code>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Chat ID: <code>{getattr(getattr(m, 'chat', None), 'id', None)}</code>\n"
+            f"Sender IDs: <code>{html.escape(sender_ids)}</code>\n"
+            f"BOT_ID: <code>{html.escape(str(CONFIG.get('bot_id')))}</code>\n"
+            f"{html.escape(extra)}",
+            parse_html=True,
+            app=app,
+        )
+    except Exception:
+        pass
+
+
 async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     if not CONFIG.get("auto_forward_enabled"):
         return
 
-    if session_key not in CONFIG.get("auto_catch_sessions", {"a"}):
+    if session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
         return
 
     if auto_forward_paused or auto_forward_error:
@@ -1704,10 +1772,12 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     if not is_group_enabled(chat_id):
         return
 
-    if not m.from_user or m.from_user.id != bot_id:
+    message_text = get_message_text(m)
+
+    if not is_source_bot_message(m):
+        await log_auto_skip_debug(app, session_key, m, "sender_mismatch")
         return
 
-    message_text = get_message_text(m)
 
     if await handle_attention_log(app, m, session_key):
         return
@@ -1983,7 +2053,7 @@ async def handle_success_edited(app: Client, session_key: str, m) -> None:
     if chat_id not in SOURCE_GROUPS_CONFIG or not is_group_enabled(chat_id):
         return
 
-    if not m.from_user or m.from_user.id != bot_id:
+    if not is_source_bot_message(m):
         return
 
     message_text = get_message_text(m)
@@ -2036,7 +2106,7 @@ async def handle_fail_new_message(app: Client, session_key: str, m) -> None:
         return
 
     bot_id = CONFIG.get("bot_id")
-    if bot_id and (not m.from_user or m.from_user.id != bot_id):
+    if bot_id and not is_source_bot_message(m):
         return
 
     reply_to_id = getattr(m, "reply_to_message_id", None)
