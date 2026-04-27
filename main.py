@@ -342,7 +342,7 @@ def load_config() -> dict:
         "captcha_auto_approve": getenv_bool("CAPTCHA_AUTO_APPROVE", False),
         "captcha_auto_approve_methods": {
             x.strip()
-            for x in os.getenv("CAPTCHA_AUTO_APPROVE_METHODS", "plain_image_marker,tesseract_ocr,easyocr_ocr,ocr_vote").split(",")
+            for x in os.getenv("CAPTCHA_AUTO_APPROVE_METHODS", "plain_image_marker,visual_option_match,tesseract_ocr,easyocr_ocr,ocr_vote").split(",")
             if x.strip()
         },
         "captcha_min_confidence": getenv_float("MIN_SOLVER_CONFIDENCE", getenv_float("CAPTCHA_MIN_CONFIDENCE", 0.60)),
@@ -2399,6 +2399,262 @@ def _score_candidate_from_text(text: str, options: list[str]) -> dict[str, float
     return scores
 
 
+# Option-guided visual digit solver for line/noise captcha.
+# This does not rely on OCR text. It extracts dark digit-like components,
+# scores each component against built-in digit templates, then chooses the
+# best answer from the actual Telegram button options.
+_DIGIT_TEMPLATE_CACHE: Optional[dict[str, list[Any]]] = None
+
+
+def _resize_digit_bitmap_to_square(binary, size: int = 32):
+    if not captcha_cv_ready() or binary is None:
+        return None
+
+    if len(binary.shape) == 3:
+        binary = cv2.cvtColor(binary, cv2.COLOR_BGR2GRAY)
+
+    binary = (binary > 0).astype("uint8") * 255
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0:
+        return np.zeros((size, size), dtype="uint8")
+
+    crop = binary[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    h, w = crop.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.zeros((size, size), dtype="uint8")
+
+    scale = min((size - 4) / max(1, w), (size - 4) / max(1, h))
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((size, size), dtype="uint8")
+    x0 = (size - new_w) // 2
+    y0 = (size - new_h) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
+
+
+def _get_digit_template_cache() -> dict[str, list[Any]]:
+    global _DIGIT_TEMPLATE_CACHE
+
+    if _DIGIT_TEMPLATE_CACHE is not None:
+        return _DIGIT_TEMPLATE_CACHE
+
+    if not captcha_cv_ready():
+        _DIGIT_TEMPLATE_CACHE = {}
+        return _DIGIT_TEMPLATE_CACHE
+
+    fonts = [
+        cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.FONT_HERSHEY_PLAIN,
+        cv2.FONT_HERSHEY_DUPLEX,
+        cv2.FONT_HERSHEY_COMPLEX_SMALL,
+        cv2.FONT_HERSHEY_TRIPLEX,
+        cv2.FONT_HERSHEY_COMPLEX,
+    ]
+
+    cache: dict[str, list[Any]] = {str(i): [] for i in range(10)}
+    for digit in cache.keys():
+        for font in fonts:
+            for scale in (1.0, 1.2, 1.4, 1.6, 1.8, 2.0):
+                for thickness in (1, 2, 3):
+                    canvas = np.zeros((80, 80), dtype="uint8")
+                    (tw, th), _ = cv2.getTextSize(digit, font, scale, thickness)
+                    x = max(0, (80 - tw) // 2)
+                    y = max(th + 2, (80 + th) // 2)
+                    cv2.putText(canvas, digit, (x, y), font, scale, 255, thickness, cv2.LINE_AA)
+
+                    variants = [canvas]
+                    variants.append(cv2.dilate(canvas, np.ones((2, 2), np.uint8), iterations=1))
+                    variants.append(cv2.erode(canvas, np.ones((2, 2), np.uint8), iterations=1))
+
+                    for variant in variants:
+                        tpl = _resize_digit_bitmap_to_square(variant, 32)
+                        if tpl is not None:
+                            cache[digit].append(tpl)
+
+    _DIGIT_TEMPLATE_CACHE = cache
+    return _DIGIT_TEMPLATE_CACHE
+
+
+def _score_digit_bitmap_against_templates(binary) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    if not captcha_cv_ready() or binary is None:
+        return scores
+
+    roi = _resize_digit_bitmap_to_square(binary, 32)
+    if roi is None:
+        return scores
+
+    roi_f = roi.astype("float32") / 255.0
+    roi_b = roi_f > 0.20
+    roi_norm = float(np.sqrt(np.sum(roi_f * roi_f)))
+
+    templates = _get_digit_template_cache()
+    for digit, digit_templates in templates.items():
+        best = 0.0
+        for template in digit_templates:
+            tpl_f = template.astype("float32") / 255.0
+            tpl_b = tpl_f > 0.20
+
+            union = np.sum(roi_b | tpl_b)
+            if union <= 0:
+                iou = 0.0
+            else:
+                iou = float(np.sum(roi_b & tpl_b) / union)
+
+            tpl_norm = float(np.sqrt(np.sum(tpl_f * tpl_f)))
+            if roi_norm <= 1e-6 or tpl_norm <= 1e-6:
+                corr = 0.0
+            else:
+                corr = float(np.sum(roi_f * tpl_f) / (roi_norm * tpl_norm + 1e-6))
+
+            score = (0.50 * iou) + (0.50 * corr)
+            if score > best:
+                best = score
+
+        scores[digit] = best
+
+    return scores
+
+
+def _extract_digit_components_from_mask(mask) -> list[tuple[int, int, int, int, int, float, float]]:
+    components: list[tuple[int, int, int, int, int, float, float]] = []
+    if not captcha_cv_ready() or mask is None:
+        return components
+
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    for idx in range(1, count):
+        x, y, w, h, area = stats[idx]
+        if area < 100:
+            continue
+        if not (10 <= w <= 60 and 18 <= h <= 60):
+            continue
+        if (w / max(1, h)) > 2.4 or (h / max(1, w)) > 3.8:
+            continue
+        density = float(area) / float(max(1, w * h))
+        if density < 0.12 or density > 0.90:
+            continue
+        cx, cy = centroids[idx]
+        components.append((int(x), int(y), int(w), int(h), int(area), float(cx), float(cy)))
+
+    return components
+
+
+def _choose_digit_component_group(components: list[tuple[int, int, int, int, int, float, float]], count_needed: int = 4):
+    if len(components) < count_needed:
+        return None
+
+    import itertools
+
+    top = sorted(components, key=lambda c: c[4], reverse=True)[:12]
+    best_group = None
+    best_value = -1e9
+
+    for group in itertools.combinations(top, count_needed):
+        group = sorted(group, key=lambda c: c[5])
+        xs = [c[5] for c in group]
+        ys = [c[6] for c in group]
+
+        if len(xs) > 1 and min(np.diff(xs)) < 40:
+            continue
+
+        y_spread = max(ys) - min(ys)
+        if y_spread > 120:
+            continue
+
+        x_spread = xs[-1] - xs[0] if len(xs) > 1 else 0
+        value = sum(c[4] for c in group) - (2.0 * y_spread) + (0.03 * x_spread)
+        if value > best_value:
+            best_value = value
+            best_group = group
+
+    return list(best_group) if best_group else None
+
+
+def solve_by_visual_option_match(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+    """
+    Best for this captcha type: digits are visible but OCR misses them because of
+    colored lines and small black dots. We read digit-like dark components and
+    score only against the numeric button options, e.g. 3652 | 9036 | 1065 | 3825 | 4902.
+    """
+    if not captcha_cv_ready() or img is None:
+        return None
+
+    options = [normalize_option(x) for x in options if is_numeric_option(str(x))]
+    options = [x for x in options if len(x) == 4]
+    if not options:
+        return None
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    best_answer = None
+    best_score = 0.0
+    best_margin = 0.0
+    best_scores_for_debug = []
+
+    # Low saturation + dark value catches black/gray digits and ignores colored lines.
+    # Multiple thresholds handle Telegram compression and slightly different screenshots.
+    for sat_max, value_max in ((70, 190), (80, 190), (60, 200), (50, 200), (80, 180)):
+        mask = ((hsv[:, :, 2] < value_max) & (hsv[:, :, 1] < sat_max)).astype("uint8") * 255
+        components = _extract_digit_components_from_mask(mask)
+        group = _choose_digit_component_group(components, 4)
+        if not group:
+            continue
+
+        per_position_scores: list[dict[str, float]] = []
+        for x, y, w, h, area, cx, cy in group:
+            pad = 8
+            crop = mask[
+                max(0, y - pad):min(mask.shape[0], y + h + pad),
+                max(0, x - pad):min(mask.shape[1], x + w + pad),
+            ]
+            ys, xs = np.where(crop > 0)
+            if len(xs) > 0:
+                crop = crop[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+            per_position_scores.append(_score_digit_bitmap_against_templates(crop))
+
+        candidate_scores: list[tuple[str, float, list[float]]] = []
+        for option in options:
+            if len(option) != len(per_position_scores):
+                continue
+            parts = [per_position_scores[pos].get(ch, 0.0) for pos, ch in enumerate(option)]
+            score = float(sum(parts) / max(1, len(parts)))
+            candidate_scores.append((option, score, parts))
+
+        if not candidate_scores:
+            continue
+
+        candidate_scores.sort(key=lambda item: item[1], reverse=True)
+        top_answer, top_score, top_parts = candidate_scores[0]
+        second_score = candidate_scores[1][1] if len(candidate_scores) > 1 else 0.0
+        margin = top_score - second_score
+        final_quality = top_score + margin
+
+        if best_answer is None or final_quality > (best_score + best_margin):
+            best_answer = top_answer
+            best_score = top_score
+            best_margin = margin
+            best_scores_for_debug = candidate_scores[:3]
+
+    if not best_answer:
+        return None
+
+    # Be conservative: there must be a meaningful gap over the next option.
+    if best_score < 0.38 or best_margin < 0.04:
+        logging.info(
+            "visual_option_match weak result answer=%s score=%.3f margin=%.3f candidates=%s",
+            best_answer,
+            best_score,
+            best_margin,
+            best_scores_for_debug,
+        )
+        return None
+
+    confidence = min(0.93, 0.52 + (0.25 * best_score) + (0.65 * min(0.50, best_margin)))
+    return best_answer, confidence, "visual_option_match"
+
+
 def solve_by_tesseract(img, options: list[str]) -> Optional[tuple[str, float, str]]:
     if not CONFIG.get("enable_ocr_fallback", True):
         return None
@@ -2522,6 +2778,10 @@ def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, flo
         answer, conf = marker_result
         if answer in options:
             return answer, min(0.99, max(0.85, conf)), "plain_image_marker"
+
+    visual_result = solve_by_visual_option_match(img, options)
+    if visual_result:
+        return visual_result
 
     results: list[tuple[str, float, str]] = []
     for solver in [solve_by_tesseract, solve_by_easyocr]:
