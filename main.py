@@ -40,7 +40,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@BikaSec"
+DEFAULT_OWNER_TAG = "@Official_Bika"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
@@ -228,8 +228,8 @@ def parse_session_keys(raw: str, default: str = "a") -> Set[str]:
 
 
 def load_config() -> dict:
-    min_delay = getenv_int("MIN_REPLY_DELAY", 2)
-    max_delay = getenv_int("MAX_REPLY_DELAY", 4)
+    min_delay = getenv_float("MIN_REPLY_DELAY", 2.0)
+    max_delay = getenv_float("MAX_REPLY_DELAY", 4.0)
 
     if min_delay > max_delay:
         min_delay, max_delay = max_delay, min_delay
@@ -301,6 +301,28 @@ def setup_logging(debug: bool) -> None:
     logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 
+async def warmup_peer_cache(app: Optional[Client] = None, limit: int = 200) -> bool:
+    """
+    Pyrogram string sessions with in_memory=True may not have chat peer cache.
+    get_dialogs() loads recent peers so numeric -100... chat IDs become sendable.
+    """
+    client = app or app_a or app_b
+    log_group_id = CONFIG.get("log_group_id")
+
+    if client is None or not log_group_id:
+        return False
+
+    try:
+        async for dialog in client.get_dialogs(limit=limit):
+            chat = dialog.chat
+            if chat and chat.id == log_group_id:
+                return True
+    except Exception as e:
+        logging.warning("warmup_peer_cache failed: %s", e)
+
+    return False
+
+
 async def send_log(text: str, parse_html: bool = False, app: Optional[Client] = None) -> None:
     client = app or app_a or app_b
     log_group_id = CONFIG.get("log_group_id")
@@ -308,17 +330,30 @@ async def send_log(text: str, parse_html: bool = False, app: Optional[Client] = 
     if client is None or not log_group_id:
         return
 
-    try:
-        await client.send_message(
+    async def _send_once():
+        return await client.send_message(
             log_group_id,
             text,
             parse_mode=ParseMode.HTML if parse_html else None,
             disable_web_page_preview=True,
         )
+
+    try:
+        await _send_once()
     except FloodWait as e:
         logging.warning("send_log FloodWait: sleeping %s seconds", e.value)
         await asyncio.sleep(e.value)
     except Exception as e:
+        if "Peer id invalid" in str(e):
+            warmed = await warmup_peer_cache(client)
+            if warmed:
+                try:
+                    await _send_once()
+                    return
+                except Exception as retry_error:
+                    logging.warning("send_log retry failed: %s", retry_error)
+                    return
+
         logging.warning("send_log failed: %s", e)
 
 
@@ -755,12 +790,6 @@ async def ensure_ids() -> None:
     if session_b_id is None:
         session_b_id = (await app_b.get_me()).id
 
-async def warmup_peer_cache(app: Client) -> None:
-    try:
-        async for _ in app.get_dialogs(limit=100):
-            pass
-    except Exception as e:
-        logging.warning("warmup_peer_cache failed: %s", e)
 
 def get_text(which: str) -> str:
     pool = sessa_lines if which == "a" else sessb_lines
@@ -978,8 +1007,10 @@ def get_total_active_time() -> float:
     return total
 
 
-async def mark_spawn_processed(chat_id: int, message_id: int) -> bool:
-    key = (chat_id, message_id)
+async def mark_spawn_processed(chat_id: int, message_id: int, session_key: str = "") -> bool:
+    # Include session_key so AUTO_CATCH_SESSIONS=a,b can process once per session.
+    # With AUTO_CATCH_SESSIONS=a, this behaves like a normal single-session dedupe.
+    key = (session_key, chat_id, message_id)
 
     async with processed_lock:
         if key in processed_spawn_messages:
@@ -1185,7 +1216,7 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     if not is_character_spawn_text(message_text):
         return
 
-    first_processor = await mark_spawn_processed(chat_id, m.id)
+    first_processor = await mark_spawn_processed(chat_id, m.id, session_key)
     if not first_processor:
         return
 
@@ -1294,10 +1325,12 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
     catch_command = extract_catch_command(response_text)
     if not catch_command:
+        logging.warning("Responder DM received but no /catch command found | session=%s | text=%s", session_key, response_text[:180].replace("\n", " "))
         return
 
     pending_key, pending = await select_pending_response(session_key, character_name)
     if not pending_key or not pending:
+        logging.warning("Responder DM parsed but no pending spawn found | session=%s | character=%s | command=%s | pending_count=%s", session_key, character_name, catch_command, len(pending_responses))
         return
 
     try:
@@ -1993,23 +2026,38 @@ async def handle_edited_message(app: Client, session_key: str, m) -> None:
 
 
 def register_handlers() -> None:
-    @app_a.on_message(filters.text)
+    owner_filter = filters.user(list(CONFIG["owner_ids"]))
+    responder_bot_id = CONFIG.get("responder_bot_id")
+
+    # Important: catch responder bot DM before the broad text command handler.
+    # Otherwise the owner-command text handler can consume text messages and the
+    # responder DM will never be converted into /catch command.
+    if responder_bot_id:
+        @app_a.on_message(filters.private & filters.user(responder_bot_id), group=-1)
+        async def responder_dm_a(_, m):
+            await handle_responder_dm(app_a, "a", m)
+
+        @app_b.on_message(filters.private & filters.user(responder_bot_id), group=-1)
+        async def responder_dm_b(_, m):
+            await handle_responder_dm(app_b, "b", m)
+
+    @app_a.on_message(filters.text & owner_filter, group=0)
     async def commands_a(_, m):
         await handle_owner_command(_, m)
 
-    @app_a.on_message()
+    @app_a.on_message(group=1)
     async def general_a(_, m):
         await handle_general_message(app_a, "a", m)
 
-    @app_b.on_message()
+    @app_b.on_message(group=1)
     async def general_b(_, m):
         await handle_general_message(app_b, "b", m)
 
-    @app_a.on_edited_message()
+    @app_a.on_edited_message(group=1)
     async def edited_a(_, m):
         await handle_edited_message(app_a, "a", m)
 
-    @app_b.on_edited_message()
+    @app_b.on_edited_message(group=1)
     async def edited_b(_, m):
         await handle_edited_message(app_b, "b", m)
 
@@ -2109,13 +2157,12 @@ async def main() -> None:
     await app_b.start()
 
     await ensure_ids()
-
-    await warmup_peer_cache(app_a)
-    await warmup_peer_cache(app_b)
-
     register_handlers()
 
     start_active_timer()
+
+    # Warm up Pyrogram peer cache so LOG_GROUP_ID works with in_memory string sessions.
+    await warmup_peer_cache(app_a)
 
     logging.warning(
         "Started successfully | session_a_id=%s | session_b_id=%s | groups=%s | auto_forward=%s",
