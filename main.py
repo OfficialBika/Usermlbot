@@ -762,32 +762,77 @@ def strip_invisible(text: str) -> str:
 
 
 def clean_catch_command(cmd: str) -> str:
-    cmd = strip_invisible(cmd)
+    """Clean only the command part, preserving the real name after /catch."""
+    cmd = strip_invisible(cmd or "")
     cmd = cmd.replace("`", "").replace("<code>", "").replace("</code>", "")
+    cmd = (
+        cmd.replace("：", ":")
+        .replace("﹕", ":")
+        .replace("꞉", ":")
+        .replace("ꓽ", ":")
+    )
     cmd = re.sub(r"\s+", " ", cmd).strip()
 
-    # Stop at button/footer/noise lines if accidentally captured.
+    # If extra footer text was accidentally captured, cut it.
     cmd = re.split(
-        r"\s+(?:Full|Powered|Copy|Official|Hint|NAME)\b",
+        r"\s+(?:Full\s*:|Hint\s*:|Powered\b|Copy\b|Official\b|NAME\s*:)",
         cmd,
         maxsplit=1,
         flags=re.IGNORECASE,
     )[0].strip()
 
-    if not cmd.lower().startswith("/catch"):
+    # Keep only text starting from /catch.
+    match = re.search(r"/catch(?:@\w+)?\s+.+", cmd, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"/catch(?:@\w+)?(?:\s*)", cmd, flags=re.IGNORECASE)
+    if not match:
         return ""
-    return cmd
+
+    cmd = match.group(0).strip()
+    return cmd if cmd.lower().startswith("/catch") else ""
+
+
+def _extract_after_label_line(text: str, label: str) -> Optional[str]:
+    """
+    EXACT Waifu format support:
+      ❤ Hint : /catch Euphemia
+    This returns everything after 'Hint :' on that same line.
+    """
+    for raw_line in (text or "").splitlines():
+        line = strip_invisible(raw_line).strip()
+        if not line:
+            continue
+
+        line = (
+            line.replace("：", ":")
+            .replace("﹕", ":")
+            .replace("꞉", ":")
+            .replace("ꓽ", ":")
+        )
+
+        # Allow emoji/symbols before label, and spaces around colon.
+        # Examples: "❤️ Hint: /catch Douma", "❤ Hint : /catch Euphemia"
+        match = re.search(rf"(?:^|\s){re.escape(label)}\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        after_label = match.group(1).strip()
+        cmd = clean_catch_command(after_label)
+        if cmd:
+            return cmd
+
+    return None
 
 
 def extract_catch_command(response_text: str) -> Optional[str]:
     """
-    Robustly extract catch command from responder bot reply.
-    Supports:
-      ❤️ Hint: /catch Douma
-      Hint : /catch Douma
-      Hint：/catch Douma
-      Full: /catch Name [Extra]
-      Any fallback /catch line
+    Extract /catch command from responder bot reply.
+
+    Priority:
+    1) Take EVERYTHING after 'Hint :' on the same line.
+       Example: '❤ Hint : /catch Euphemia' -> '/catch Euphemia'
+    2) If Hint is absent, take everything after 'Full :'.
+    3) Fallback: first /catch line anywhere in text.
     """
     text = strip_invisible(response_text or "")
     if not text:
@@ -800,20 +845,24 @@ def extract_catch_command(response_text: str) -> Optional[str]:
         .replace("ꓽ", ":")
     )
 
-    patterns = [
-        r"(?:^|\n)[^\n]{0,60}?Hint\s*:\s*(/catch[^\n\r]+)",
-        r"(?:^|\n)[^\n]{0,60}?Full\s*:\s*(/catch[^\n\r]+)",
-        r"(/catch[^\n\r]+)",
-    ]
+    # 1) Exact requested behavior: use Hint line first.
+    cmd = _extract_after_label_line(text, "Hint")
+    if cmd:
+        return cmd
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            cmd = clean_catch_command(match.group(1))
-            if cmd:
-                return cmd
+    # 2) Fallback to Full line.
+    cmd = _extract_after_label_line(text, "Full")
+    if cmd:
+        return cmd
+
+    # 3) Last fallback: any /catch until the end of its line.
+    match = re.search(r"(/catch(?:@\w+)?[^\n\r]*)", text, flags=re.IGNORECASE)
+    if match:
+        cmd = clean_catch_command(match.group(1))
+        if cmd:
+            return cmd
+
     return None
-
 
 def extract_catch_command_from_buttons(m) -> Optional[str]:
     """Try to read /catch from inline keyboard/copy-text buttons when text parsing fails."""
@@ -1429,12 +1478,12 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
     """
     Convert responder bot DM into /catch command in the original group.
 
-    Fixes for Waifu Cheat Bot:
-    - Accept ChatType.BOT and ChatType.PRIVATE.
-    - Broad early handler catches all messages; this function self-filters.
-    - Allows RESPONDER_BOT_IDS list, but can still process any bot DM that contains /catch.
-    - Reads /catch from message text and inline CopyTextButton fallback.
-    - Falls back to latest pending spawn when NAME does not match pending NAME placeholder.
+    Important Waifu Cheat Bot fixes:
+    - Waifu can send an empty/new message first, then EDIT the same message to add
+      NAME / Hint / Full. We only dedupe AFTER a /catch command is found.
+    - When the line is '❤ Hint : /catch Euphemia', the bot takes exactly the text
+      after 'Hint :' and sends only '/catch Euphemia'.
+    - Also refetches the same responder message a few times if the first event is empty.
     """
     try:
         if not CONFIG.get("auto_forward_enabled"):
@@ -1446,20 +1495,6 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
         if m.chat.type not in {ChatType.PRIVATE, ChatType.BOT}:
             return
 
-        # Deduplicate because this function is called from an early responder handler and general handler.
-        dedupe_key = (session_key, int(m.chat.id), int(m.id))
-        async with responder_dm_lock:
-            if dedupe_key in responder_dm_seen:
-                return
-            responder_dm_seen.add(dedupe_key)
-            if len(responder_dm_seen) > 3000:
-                responder_dm_seen.clear()
-
-        response_text = get_message_text(m)
-        catch_command = extract_catch_command(response_text)
-        if not catch_command:
-            catch_command = extract_catch_command_from_buttons(m)
-
         sender_id = m.from_user.id if m.from_user else None
         responder_ids = set(CONFIG.get("responder_bot_ids") or set())
         responder_bot_id = CONFIG.get("responder_bot_id")
@@ -1468,6 +1503,29 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
         is_known_responder = bool(sender_id and int(sender_id) in responder_ids)
         is_bot_sender = bool(m.from_user and m.from_user.is_bot)
+
+        response_text = get_message_text(m)
+        catch_command = extract_catch_command(response_text)
+        if not catch_command:
+            catch_command = extract_catch_command_from_buttons(m)
+
+        # Waifu Cheat Bot often edits the reply after the first NewMessage event.
+        # If text/button command is empty at first, refetch the same message.
+        if is_known_responder and not catch_command:
+            for wait_seconds in (0.8, 1.6, 2.5):
+                await asyncio.sleep(wait_seconds)
+                try:
+                    fresh = await app.get_messages(m.chat.id, m.id)
+                except Exception:
+                    fresh = None
+                if fresh:
+                    m = fresh
+                    response_text = get_message_text(m)
+                    catch_command = extract_catch_command(response_text)
+                    if not catch_command:
+                        catch_command = extract_catch_command_from_buttons(m)
+                    if catch_command:
+                        break
 
         # Normal path: known responder bot. Fallback path: any bot DM containing /catch.
         if not is_known_responder and not (is_bot_sender and catch_command):
@@ -1486,7 +1544,18 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
             )
 
         if not catch_command:
+            # Do NOT mark this message as seen. It may be edited later, and
+            # handle_edited_message() can then process it.
             return
+
+        # Deduplicate only after command is actually found.
+        dedupe_key = (session_key, int(m.chat.id), int(m.id))
+        async with responder_dm_lock:
+            if dedupe_key in responder_dm_seen:
+                return
+            responder_dm_seen.add(dedupe_key)
+            if len(responder_dm_seen) > 3000:
+                responder_dm_seen.clear()
 
         normalized_response = unicodedata.normalize("NFKC", response_text or "")
         name_match = re.search(
@@ -1499,7 +1568,7 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
         pending_key, pending = await select_pending_response(session_key, character_name)
 
-        # Waifu replies often have the real NAME while original post contains placeholder NAME.
+        # Waifu replies have the real NAME while original post usually contains placeholder NAME.
         # If exact-name matching fails, use the latest non-waiting pending for this session.
         if not pending_key or not pending:
             await cleanup_stale_pending()
@@ -2971,6 +3040,9 @@ async def handle_general_message(app: Client, session_key: str, m) -> None:
 
 async def handle_edited_message(app: Client, session_key: str, m) -> None:
     try:
+        # Waifu Cheat Bot may send an empty message first and then edit it with
+        # NAME / Hint / Full. Process responder edits before normal success edits.
+        await handle_responder_dm(app, session_key, m)
         await handle_success_edited(app, session_key, m)
     except Exception as e:
         logging.warning("handle_edited_message_%s failed: %s", session_key, e)
