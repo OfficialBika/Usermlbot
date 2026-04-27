@@ -111,6 +111,8 @@ processed_lock = asyncio.Lock()
 
 # Responder DM duplicate protection
 responder_dm_seen: set[Tuple[str, int, int]] = set()
+# Retry protection for responder bots that answer/edit after delay
+responder_retry_seen: set[Tuple[str, int, int]] = set()
 responder_dm_lock = asyncio.Lock()
 
 db_conn: Optional[sqlite3.Connection] = None
@@ -1331,6 +1333,24 @@ def get_message_text(m) -> str:
     return m.text or m.caption or ""
 
 
+def get_responder_message_text(m) -> str:
+    """Return all text-like fields from responder messages. Some bot messages arrive empty first and are later edited."""
+    parts: list[str] = []
+    for attr in ("text", "caption"):
+        value = getattr(m, attr, None)
+        if value:
+            parts.append(str(value))
+
+    reply = getattr(m, "reply_to_message", None)
+    if reply:
+        for attr in ("text", "caption"):
+            value = getattr(reply, attr, None)
+            if value:
+                parts.append(str(value))
+
+    return "\n".join(parts)
+
+
 async def handle_attention_log(app: Client, m, session_key: str) -> bool:
     message_text = get_message_text(m)
     if not is_attention_text(message_text):
@@ -1504,27 +1524,67 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
         is_known_responder = bool(sender_id and int(sender_id) in responder_ids)
         is_bot_sender = bool(m.from_user and m.from_user.is_bot)
 
-        response_text = get_message_text(m)
+        response_text = get_responder_message_text(m)
         catch_command = extract_catch_command(response_text)
         if not catch_command:
             catch_command = extract_catch_command_from_buttons(m)
 
-        # Waifu Cheat Bot often edits the reply after the first NewMessage event.
-        # If text/button command is empty at first, refetch the same message.
+        # Waifu Cheat Bot can reply slowly. Sometimes the first DM event is empty,
+        # then the bot edits it or sends another message with NAME / Hint / Full.
+        # Search the same message + recent responder DM history for up to ~35 sec.
         if is_known_responder and not catch_command:
-            for wait_seconds in (0.8, 1.6, 2.5):
-                await asyncio.sleep(wait_seconds)
-                try:
-                    fresh = await app.get_messages(m.chat.id, m.id)
-                except Exception:
-                    fresh = None
-                if fresh:
-                    m = fresh
-                    response_text = get_message_text(m)
-                    catch_command = extract_catch_command(response_text)
-                    if not catch_command:
-                        catch_command = extract_catch_command_from_buttons(m)
+            retry_key = (session_key, int(m.chat.id), int(m.id))
+            async with responder_dm_lock:
+                retry_allowed = retry_key not in responder_retry_seen
+                if retry_allowed:
+                    responder_retry_seen.add(retry_key)
+                    if len(responder_retry_seen) > 3000:
+                        responder_retry_seen.clear()
+
+            if retry_allowed:
+                for wait_seconds in (1.5, 2.5, 4.0, 6.0, 9.0, 12.0):
+                    await asyncio.sleep(wait_seconds)
+                    candidates = []
+                    try:
+                        fresh = await app.get_messages(m.chat.id, m.id)
+                        if fresh:
+                            candidates.append(fresh)
+                    except Exception:
+                        pass
+
+                    try:
+                        async for item in app.get_chat_history(m.chat.id, limit=12):
+                            candidates.append(item)
+                    except Exception:
+                        pass
+
+                    for candidate in candidates:
+                        try:
+                            candidate_sender = candidate.from_user.id if candidate.from_user else None
+                            if sender_id and candidate_sender and int(candidate_sender) != int(sender_id):
+                                continue
+
+                            candidate_text = get_responder_message_text(candidate)
+                            candidate_command = extract_catch_command(candidate_text)
+                            if not candidate_command:
+                                candidate_command = extract_catch_command_from_buttons(candidate)
+
+                            if candidate_command:
+                                m = candidate
+                                response_text = candidate_text
+                                catch_command = candidate_command
+                                break
+                        except Exception:
+                            continue
+
                     if catch_command:
+                        await send_log(
+                            "🔁 <b>Delayed responder command found</b>\n"
+                            f"Session: <code>{html.escape(session_key)}</code>\n"
+                            f"Command: <code>{html.escape(catch_command)}</code>",
+                            parse_html=True,
+                            app=app,
+                        )
                         break
 
         # Normal path: known responder bot. Fallback path: any bot DM containing /catch.
