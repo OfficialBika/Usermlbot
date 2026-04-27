@@ -9,6 +9,7 @@ import sqlite3
 import time
 import unicodedata
 from datetime import datetime, timedelta
+from io import BytesIO
 from typing import Any, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,13 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatAction, ChatType, ParseMode
 from pyrogram.errors import FloodWait
+
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = None
+    np = None
 
 # Important for PM2 / old environment cache
 load_dotenv(override=True)
@@ -40,7 +48,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@Bikasec"
+DEFAULT_OWNER_TAG = "@Official_Bika"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
@@ -104,6 +112,12 @@ processed_lock = asyncio.Lock()
 db_conn: Optional[sqlite3.Connection] = None
 db_lock = asyncio.Lock()
 
+# Captcha auto-solver state
+pending_captchas: dict[int, dict[str, Any]] = {}
+captcha_message_to_request: dict[Tuple[str, int, int], int] = {}
+captcha_lock = asyncio.Lock()
+processed_captcha_messages: set[Tuple[str, int, int]] = set()
+easyocr_reader = None
 
 def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
@@ -284,6 +298,26 @@ def load_config() -> dict:
         "auto_delete_catch_command": getenv_bool("AUTO_DELETE_CATCH_COMMAND", True),
         "catch_delete_after_seconds": getenv_float("CATCH_DELETE_AFTER_SECONDS", 1.0),
         "pending_max_age_seconds": getenv_int("PENDING_MAX_AGE_SECONDS", 180),
+
+        # Captcha auto-solver (for your own private captcha flow)
+        "captcha_solver_enabled": getenv_bool("CAPTCHA_SOLVER_ENABLED", False),
+        "captcha_bot_id": getenv_optional_int("CAPTCHA_BOT_ID", default=bot_id),
+        "captcha_target_groups": getenv_int_set("CAPTCHA_TARGET_GROUPS", "GROUP_IDS") if (os.getenv("CAPTCHA_TARGET_GROUPS") or "").strip() else group_ids,
+        "captcha_solver_sessions": parse_session_keys(os.getenv("CAPTCHA_SOLVER_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a")), "a"),
+        "captcha_auto_approve": getenv_bool("CAPTCHA_AUTO_APPROVE", False),
+        "captcha_auto_approve_methods": {
+            x.strip()
+            for x in os.getenv("CAPTCHA_AUTO_APPROVE_METHODS", "plain_image_marker,tesseract_ocr,easyocr_ocr,ocr_vote").split(",")
+            if x.strip()
+        },
+        "captcha_min_confidence": getenv_float("MIN_SOLVER_CONFIDENCE", getenv_float("CAPTCHA_MIN_CONFIDENCE", 0.60)),
+        "captcha_auto_min_confidence": getenv_float("CAPTCHA_AUTO_APPROVE_MIN_CONFIDENCE", 0.75),
+        "captcha_approval_timeout": getenv_int("APPROVAL_TIMEOUT_SEC", 120),
+        "enable_ocr_fallback": getenv_bool("ENABLE_OCR_FALLBACK", True),
+        "enable_tesseract_ocr": getenv_bool("ENABLE_TESSERACT_OCR", True),
+        "enable_easyocr": getenv_bool("ENABLE_EASYOCR", False),
+        "captcha_log_no_answer": getenv_bool("CAPTCHA_LOG_NO_ANSWER", True),
+        "captcha_debug_save": getenv_bool("CAPTCHA_DEBUG_SAVE", False),
     }
 
 
@@ -1512,6 +1546,699 @@ async def handle_fail_new_message(app: Client, session_key: str, m) -> None:
     )
 
 
+
+# =========================
+# CAPTCHA AUTO-SOLVER
+# =========================
+
+def captcha_cv_ready() -> bool:
+    return cv2 is not None and np is not None
+
+
+def normalize_option(text: str | int) -> str:
+    text = str(text or "").strip()
+    if text.isdigit() and len(text) <= 4:
+        return text.zfill(4)
+    return text
+
+
+def is_numeric_option(text: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,4}", str(text or "").strip()))
+
+
+def extract_numeric_buttons_pyro(m) -> list[str]:
+    options: list[str] = []
+    rows = getattr(getattr(m, "reply_markup", None), "inline_keyboard", None)
+    if not rows:
+        return options
+    for row in rows:
+        for btn in row:
+            text = normalize_option(getattr(btn, "text", "") or "")
+            if is_numeric_option(text) and text not in options:
+                options.append(text)
+    return options
+
+
+def looks_like_captcha_message(m) -> bool:
+    if not CONFIG.get("captcha_solver_enabled"):
+        return False
+    if not m.chat or m.chat.id not in CONFIG.get("captcha_target_groups", set()):
+        return False
+    captcha_bot_id = CONFIG.get("captcha_bot_id")
+    if captcha_bot_id and (not m.from_user or m.from_user.id != captcha_bot_id):
+        return False
+    if not getattr(m, "photo", None):
+        return False
+    options = extract_numeric_buttons_pyro(m)
+    if len(options) < 2:
+        return False
+    text = get_message_text(m)
+    normalized = normalize_text(text)
+    return (
+        "captcha" in normalized
+        or "attention" in normalized
+        or "solve" in normalized
+        or "special character" in normalized
+        or len(options) >= 3
+    )
+
+
+async def download_pyro_message_media_as_cv2(app: Client, m):
+    if not captcha_cv_ready():
+        return None
+    try:
+        data = await app.download_media(m, in_memory=True)
+    except Exception as e:
+        logging.warning("captcha download_media failed: %s", e)
+        return None
+    if not data:
+        return None
+    try:
+        if isinstance(data, BytesIO):
+            raw = data.getvalue()
+        elif hasattr(data, "getbuffer"):
+            raw = bytes(data.getbuffer())
+        elif isinstance(data, (bytes, bytearray)):
+            raw = bytes(data)
+        else:
+            return None
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        logging.warning("captcha cv2 decode failed: %s", e)
+        return None
+
+
+async def click_button_by_text_pyro(m, answer: str) -> bool:
+    answer = normalize_option(answer)
+    rows = getattr(getattr(m, "reply_markup", None), "inline_keyboard", None)
+    if not rows:
+        return False
+    for row_index, row in enumerate(rows):
+        for col_index, btn in enumerate(row):
+            text = normalize_option(getattr(btn, "text", "") or "")
+            if text == answer:
+                await m.click(row_index, col_index)
+                return True
+    return False
+
+
+# Plain image marker decoder: works only if your own captcha generator embeds it.
+MARKER_MAGIC_BITS = [1, 0, 1, 1]
+MARKER_ANSWER_BITS = 14
+MARKER_TOTAL_BITS = len(MARKER_MAGIC_BITS) + MARKER_ANSWER_BITS
+MARKER_CELL = int(os.getenv("MARKER_CELL", "6"))
+MARKER_REPEAT = int(os.getenv("MARKER_REPEAT", "3"))
+MARKER_START_X = int(os.getenv("MARKER_START_X", "6"))
+MARKER_START_Y = int(os.getenv("MARKER_START_Y", "6"))
+MARKER_THRESHOLD = int(os.getenv("MARKER_THRESHOLD", "128"))
+
+
+def _bits_to_int(bits: list[int]) -> int:
+    value = 0
+    for bit in bits:
+        value = (value << 1) | int(bit)
+    return value
+
+
+def _marker_positions(img_width: int) -> list[tuple[int, int]]:
+    total_cells = MARKER_TOTAL_BITS * MARKER_REPEAT
+    usable_width = img_width - MARKER_START_X - 4
+    if usable_width < MARKER_CELL:
+        return []
+    cells_per_row = max(1, usable_width // MARKER_CELL)
+    return [
+        (
+            MARKER_START_X + (i % cells_per_row) * MARKER_CELL,
+            MARKER_START_Y + (i // cells_per_row) * MARKER_CELL,
+        )
+        for i in range(total_cells)
+    ]
+
+
+def decode_plain_answer_marker(img) -> Optional[tuple[str, float]]:
+    if not captcha_cv_ready() or img is None or img.size == 0:
+        return None
+    h, w = img.shape[:2]
+    positions = _marker_positions(w)
+    if not positions:
+        return None
+    last_x, last_y = positions[-1]
+    if last_y + MARKER_CELL > h or last_x + MARKER_CELL > w:
+        return None
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    raw_bits: list[int] = []
+    raw_votes: list[float] = []
+
+    for x, y in positions:
+        crop = gray[y:y + MARKER_CELL, x:x + MARKER_CELL]
+        if crop.size == 0:
+            return None
+        mean_value = float(crop.mean())
+        raw_bits.append(1 if mean_value < MARKER_THRESHOLD else 0)
+        raw_votes.append(min(1.0, abs(mean_value - MARKER_THRESHOLD) / 120.0))
+
+    bits: list[int] = []
+    confs: list[float] = []
+    for i in range(0, len(raw_bits), MARKER_REPEAT):
+        group = raw_bits[i:i + MARKER_REPEAT]
+        group_conf = raw_votes[i:i + MARKER_REPEAT]
+        one_count = sum(group)
+        bits.append(1 if one_count >= ((MARKER_REPEAT // 2) + 1) else 0)
+        agreement = max(one_count, MARKER_REPEAT - one_count) / max(1, MARKER_REPEAT)
+        confs.append(float(agreement * (sum(group_conf) / max(1, len(group_conf)))))
+
+    if bits[:len(MARKER_MAGIC_BITS)] != MARKER_MAGIC_BITS:
+        return None
+
+    answer_num = _bits_to_int(bits[len(MARKER_MAGIC_BITS):])
+    if not (0 <= answer_num <= 9999):
+        return None
+    return str(answer_num).zfill(4), sum(confs) / max(1, len(confs))
+
+
+def _clean_ocr_digits(text: str) -> str:
+    return "".join(re.findall(r"\d", text or ""))
+
+
+def _remove_colored_lines_keep_dark_digits(img):
+    if not captcha_cv_ready():
+        return img
+    out = img.copy()
+    hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
+    # Colored lines usually have saturation; black/gray digits have low saturation.
+    mask = ((hsv[:, :, 1] > 35) & (hsv[:, :, 2] > 30)).astype("uint8") * 255
+    mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
+    out[mask > 0] = (255, 255, 255)
+    return out
+
+
+def _ocr_image_variants(img) -> list[Any]:
+    variants: list[Any] = []
+    if not captcha_cv_ready() or img is None:
+        return variants
+
+    cleaned_bgr = _remove_colored_lines_keep_dark_digits(img)
+    for base in [img, cleaned_bgr]:
+        gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+        y0 = min(8, max(0, h // 30))
+        core = gray[y0:h - y0, 0:w]
+        core = cv2.resize(core, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        norm = cv2.normalize(core, None, 0, 255, cv2.NORM_MINMAX)
+        variants.extend([core, norm])
+
+        for thresh_type in [cv2.THRESH_BINARY, cv2.THRESH_BINARY_INV]:
+            _, th = cv2.threshold(norm, 0, 255, thresh_type + cv2.THRESH_OTSU)
+            variants.append(th)
+            kernel = np.ones((2, 2), np.uint8)
+            variants.append(cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel))
+            variants.append(cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel))
+
+        try:
+            variants.append(
+                cv2.adaptiveThreshold(
+                    norm,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    31,
+                    9,
+                )
+            )
+        except Exception:
+            pass
+
+    return variants
+
+
+def _score_candidate_from_text(text: str, options: list[str]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    digits = _clean_ocr_digits(text)
+    if not digits:
+        return scores
+
+    possible: set[str] = set()
+    if len(digits) >= 4:
+        for i in range(0, len(digits) - 3):
+            possible.add(normalize_option(digits[i:i + 4]))
+    else:
+        possible.add(normalize_option(digits[:4]))
+
+    for candidate in possible:
+        if candidate in options:
+            scores[candidate] = scores.get(candidate, 0.0) + 1.0
+
+    return scores
+
+
+def solve_by_tesseract(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+    if not CONFIG.get("enable_ocr_fallback", True):
+        return None
+    if not CONFIG.get("enable_tesseract_ocr", True):
+        return None
+    if not captcha_cv_ready():
+        return None
+    try:
+        import pytesseract
+    except Exception:
+        return None
+
+    options = [normalize_option(x) for x in options]
+    scores: dict[str, float] = {}
+
+    for variant in _ocr_image_variants(img):
+        for psm in [6, 7, 11, 13]:
+            try:
+                text = pytesseract.image_to_string(
+                    variant,
+                    config=f"--psm {psm} --oem 3 -c tessedit_char_whitelist=0123456789",
+                )
+            except Exception:
+                continue
+
+            for candidate, score in _score_candidate_from_text(text, options).items():
+                scores[candidate] = scores.get(candidate, 0.0) + score
+
+    if not scores:
+        return None
+
+    best, best_score = max(scores.items(), key=lambda kv: kv[1])
+    total = sum(scores.values())
+    confidence = min(0.88, 0.45 + 0.43 * (best_score / max(1.0, total)))
+    return best, confidence, "tesseract_ocr"
+
+
+def _get_easyocr_reader():
+    global easyocr_reader
+    if easyocr_reader is not None:
+        return easyocr_reader
+    try:
+        import easyocr
+        easyocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        return easyocr_reader
+    except Exception as e:
+        logging.warning("easyocr unavailable: %s", e)
+        return None
+
+
+def solve_by_easyocr(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+    if not CONFIG.get("enable_ocr_fallback", True):
+        return None
+    if not CONFIG.get("enable_easyocr", False):
+        return None
+    if not captcha_cv_ready():
+        return None
+
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return None
+
+    options = [normalize_option(x) for x in options]
+    scores: dict[str, float] = {}
+
+    for variant in _ocr_image_variants(img)[:8]:
+        try:
+            results = reader.readtext(variant, allowlist="0123456789", detail=1, paragraph=False)
+        except Exception:
+            continue
+
+        for item in results:
+            try:
+                text = item[1]
+                conf = float(item[2])
+            except Exception:
+                continue
+
+            for candidate, score in _score_candidate_from_text(text, options).items():
+                scores[candidate] = scores.get(candidate, 0.0) + max(0.2, conf) * score
+
+    if not scores:
+        return None
+
+    best, best_score = max(scores.items(), key=lambda kv: kv[1])
+    total = sum(scores.values())
+    confidence = min(0.92, 0.50 + 0.42 * (best_score / max(1.0, total)))
+    return best, confidence, "easyocr_ocr"
+
+
+def vote_ocr_results(results: list[tuple[str, float, str]], options: list[str]) -> Optional[tuple[str, float, str]]:
+    if not results:
+        return None
+
+    options = [normalize_option(x) for x in options]
+    scores: dict[str, float] = {}
+    methods: dict[str, list[str]] = {}
+
+    for answer, confidence, method in results:
+        answer = normalize_option(answer)
+        if answer not in options:
+            continue
+        scores[answer] = scores.get(answer, 0.0) + max(0.01, confidence)
+        methods.setdefault(answer, []).append(method)
+
+    if not scores:
+        return None
+
+    best, score = max(scores.items(), key=lambda kv: kv[1])
+    total = sum(scores.values())
+    method_count = len(set(methods.get(best, [])))
+    confidence = min(0.95, 0.50 + 0.30 * (score / max(0.01, total)) + 0.07 * method_count)
+    return best, confidence, "ocr_vote:" + "+".join(sorted(set(methods.get(best, []))))
+
+
+def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+    options = [normalize_option(x) for x in options]
+
+    marker_result = decode_plain_answer_marker(img)
+    if marker_result:
+        answer, conf = marker_result
+        if answer in options:
+            return answer, min(0.99, max(0.85, conf)), "plain_image_marker"
+
+    results: list[tuple[str, float, str]] = []
+    for solver in [solve_by_tesseract, solve_by_easyocr]:
+        try:
+            result = solver(img, options)
+        except Exception as e:
+            logging.warning("captcha solver %s failed: %s", getattr(solver, "__name__", solver), e)
+            result = None
+        if result:
+            results.append(result)
+
+    voted = vote_ocr_results(results, options)
+    if voted:
+        return voted
+    if results:
+        return max(results, key=lambda x: x[1])
+    return None
+
+
+async def captcha_cleanup_expired() -> None:
+    timeout = CONFIG.get("captcha_approval_timeout", 120)
+    now = time.time()
+    expired: list[int] = []
+
+    async with captcha_lock:
+        for rid, item in pending_captchas.items():
+            if now - float(item.get("created_at", now)) > timeout:
+                expired.append(rid)
+
+        for rid in expired:
+            item = pending_captchas.pop(rid, None)
+            if item:
+                captcha_message_to_request.pop(
+                    (item.get("session_key"), item.get("chat_id"), item.get("message_id")),
+                    None,
+                )
+
+    for rid in expired:
+        await send_log(f"⌛ Captcha approval expired. Request ID: <code>{rid}</code>", parse_html=True)
+
+
+async def captcha_cleanup_loop() -> None:
+    while True:
+        try:
+            await captcha_cleanup_expired()
+        except Exception as e:
+            logging.warning("captcha_cleanup_loop failed: %s", e)
+        await asyncio.sleep(10)
+
+
+def make_captcha_request_id(session_key: str, chat_id: int, message_id: int) -> int:
+    prefix = 1 if session_key == "a" else 2
+    return int(f"{prefix}{abs(chat_id) % 100000}{message_id}")
+
+
+async def add_pending_captcha(
+    app: Client,
+    session_key: str,
+    m,
+    options: list[str],
+    answer: str,
+    confidence: float,
+    method: str,
+) -> int:
+    chat_id = int(m.chat.id)
+    message_id = int(m.id)
+    req_id = make_captcha_request_id(session_key, chat_id, message_id)
+    key = (session_key, chat_id, message_id)
+
+    async with captcha_lock:
+        if key in captcha_message_to_request:
+            return captcha_message_to_request[key]
+
+        item = {
+            "request_id": req_id,
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "options": options,
+            "detected_answer": normalize_option(answer),
+            "confidence": float(confidence),
+            "method": method,
+            "created_at": time.time(),
+        }
+
+        pending_captchas[req_id] = item
+        captcha_message_to_request[key] = req_id
+
+    try:
+        await app.forward_messages(CONFIG["log_group_id"], chat_id, message_id)
+    except Exception:
+        pass
+
+    await send_log(
+        "🧩 <b>Captcha answer detected. Approval needed.</b>\n"
+        f"Request ID: <code>{req_id}</code>\n"
+        f"Session: <code>{html.escape(session_key)}</code>\n"
+        f"Detected: <code>{html.escape(normalize_option(answer))}</code>\n"
+        f"Confidence: <code>{confidence:.2f}</code>\n"
+        f"Method: <code>{html.escape(method)}</code>\n"
+        f"Options: <code>{html.escape(' | '.join(options))}</code>\n\n"
+        "Approve: <code>/approve</code> or <code>/approve_id REQUEST_ID</code>\n"
+        "Reject: <code>/reject</code> or <code>/reject REQUEST_ID</code>",
+        parse_html=True,
+        app=app,
+    )
+
+    return req_id
+
+
+async def click_captcha_item(app: Client, item: dict[str, Any]) -> bool:
+    try:
+        msg = await app.get_messages(int(item["chat_id"]), int(item["message_id"]))
+        if not msg:
+            return False
+        return await click_button_by_text_pyro(msg, str(item["detected_answer"]))
+    except Exception as e:
+        logging.warning("captcha click failed: %s", e)
+        return False
+
+
+async def approve_captcha_request(m, request_id: Optional[int] = None) -> None:
+    async with captcha_lock:
+        if not pending_captchas:
+            await m.reply("No pending captcha approval.")
+            return
+
+        if request_id is None:
+            request_id = max(
+                pending_captchas.keys(),
+                key=lambda rid: pending_captchas[rid].get("created_at", 0),
+            )
+
+        item = pending_captchas.get(request_id)
+        if not item:
+            await m.reply(f"❌ Request ID not found: <code>{request_id}</code>", parse_mode=ParseMode.HTML)
+            return
+
+    app = app_a if item.get("session_key") == "a" else app_b
+    if app is None:
+        await m.reply("❌ Client session not available.")
+        return
+
+    clicked = await click_captcha_item(app, item)
+    if not clicked:
+        await m.reply(
+            "❌ Matching button not found or click failed.\n"
+            f"Answer: <code>{html.escape(str(item.get('detected_answer')))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    async with captcha_lock:
+        pending_captchas.pop(int(item["request_id"]), None)
+        captcha_message_to_request.pop(
+            (item.get("session_key"), item.get("chat_id"), item.get("message_id")),
+            None,
+        )
+
+    await m.reply(
+        "✅ Captcha approved and clicked.\n"
+        f"Request ID: <code>{item['request_id']}</code>\n"
+        f"Answer: <code>{html.escape(str(item.get('detected_answer')))}</code>\n"
+        f"Method: <code>{html.escape(str(item.get('method')))}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def reject_captcha_request(m, request_id: Optional[int] = None) -> None:
+    async with captcha_lock:
+        if not pending_captchas:
+            await m.reply("No pending captcha approval.")
+            return
+
+        if request_id is None:
+            request_id = max(
+                pending_captchas.keys(),
+                key=lambda rid: pending_captchas[rid].get("created_at", 0),
+            )
+
+        item = pending_captchas.pop(request_id, None)
+        if not item:
+            await m.reply(f"Request ID not found: <code>{request_id}</code>", parse_mode=ParseMode.HTML)
+            return
+
+        captcha_message_to_request.pop(
+            (item.get("session_key"), item.get("chat_id"), item.get("message_id")),
+            None,
+        )
+
+    await m.reply(
+        "❌ Captcha request rejected.\n"
+        f"Request ID: <code>{request_id}</code>\n"
+        f"Detected: <code>{html.escape(str(item.get('detected_answer')))}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def send_captcha_pending(m) -> None:
+    async with captcha_lock:
+        items = list(pending_captchas.values())
+
+    if not items:
+        await m.reply("No pending captcha approval.")
+        return
+
+    now = time.time()
+    lines = ["🧩 <b>Pending captcha approvals</b>"]
+    for item in sorted(items, key=lambda x: x.get("created_at", 0)):
+        age = int(now - float(item.get("created_at", now)))
+        lines.append(
+            f"• ID <code>{item.get('request_id')}</code> | "
+            f"session <code>{html.escape(str(item.get('session_key')))}</code> | "
+            f"answer <code>{html.escape(str(item.get('detected_answer')))}</code> | "
+            f"conf <code>{float(item.get('confidence', 0.0)):.2f}</code> | "
+            f"method <code>{html.escape(str(item.get('method')))}</code> | age {age}s"
+        )
+
+    lines.append(
+        "\nApprove latest: <code>/approve</code>\n"
+        "Approve by ID: <code>/approve_id ID</code>\n"
+        "Reject: <code>/reject</code>"
+    )
+    await m.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
+    if not CONFIG.get("captcha_solver_enabled"):
+        return
+
+    if session_key not in CONFIG.get("captcha_solver_sessions", {"a"}):
+        return
+
+    if not looks_like_captcha_message(m):
+        return
+
+    key = (session_key, int(m.chat.id), int(m.id))
+    async with captcha_lock:
+        if key in processed_captcha_messages:
+            return
+
+        processed_captcha_messages.add(key)
+        if len(processed_captcha_messages) > 3000:
+            processed_captcha_messages.clear()
+
+    options = extract_numeric_buttons_pyro(m)
+    if not options:
+        return
+
+    if not captcha_cv_ready():
+        await send_log(
+            "🧩 Captcha solver skipped: install <code>opencv-python-headless numpy</code>.",
+            parse_html=True,
+            app=app,
+        )
+        return
+
+    img = await download_pyro_message_media_as_cv2(app, m)
+    if img is None:
+        await send_log("🧩 Captcha image download/decode failed.", parse_html=True, app=app)
+        return
+
+    if CONFIG.get("captcha_debug_save"):
+        try:
+            debug_path = os.path.join(DATA_DIR, f"captcha_{session_key}_{m.chat.id}_{m.id}.jpg")
+            cv2.imwrite(debug_path, img)
+        except Exception:
+            pass
+
+    result = solve_captcha_image_auto(img, options)
+    if not result:
+        if CONFIG.get("captcha_log_no_answer", True):
+            await send_log(
+                "🧩 <b>Captcha detected but no answer found.</b>\n"
+                f"Session: <code>{html.escape(session_key)}</code>\n"
+                f"Options: <code>{html.escape(' | '.join(options))}</code>",
+                parse_html=True,
+                app=app,
+            )
+        return
+
+    answer, confidence, method = result
+    min_conf = CONFIG.get("captcha_min_confidence", 0.60)
+    if confidence < min_conf:
+        await send_log(
+            "🧩 <b>Captcha answer found but confidence too low.</b>\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            f"Confidence: <code>{confidence:.2f}</code> / required <code>{min_conf:.2f}</code>\n"
+            f"Method: <code>{html.escape(method)}</code>\n"
+            f"Options: <code>{html.escape(' | '.join(options))}</code>",
+            parse_html=True,
+            app=app,
+        )
+        return
+
+    auto_methods = CONFIG.get("captcha_auto_approve_methods", set())
+    auto_enabled = CONFIG.get("captcha_auto_approve", False)
+    auto_min = CONFIG.get("captcha_auto_min_confidence", 0.75)
+    method_base = method.split(":", 1)[0]
+    can_auto = auto_enabled and confidence >= auto_min and (
+        method in auto_methods or method_base in auto_methods
+    )
+
+    if can_auto:
+        clicked = await click_button_by_text_pyro(m, answer)
+        if clicked:
+            await send_log(
+                "✅ <b>Captcha auto-clicked.</b>\n"
+                f"Session: <code>{html.escape(session_key)}</code>\n"
+                f"Answer: <code>{html.escape(answer)}</code>\n"
+                f"Confidence: <code>{confidence:.2f}</code>\n"
+                f"Method: <code>{html.escape(method)}</code>\n"
+                f"Options: <code>{html.escape(' | '.join(options))}</code>",
+                parse_html=True,
+                app=app,
+            )
+            return
+
+        await send_log("❌ Captcha auto-click failed; fallback to approval.", parse_html=True, app=app)
+
+    await add_pending_captcha(app, session_key, m, options, answer, confidence, method)
+
+
 def is_owner_message(m) -> bool:
     if not m.from_user:
         return False
@@ -1560,7 +2287,9 @@ async def send_stats(m) -> None:
         f"Enabled Source Groups: {enabled_source_groups}/{len(SOURCE_GROUPS_CONFIG)}\n"
         f"Enabled Rarities: {enabled_rarities}/{len(RARITY_CONFIG)}\n"
         f"Chat Loops Running: {len(running_chat_loops)}\n"
-        f"Auto Catch Sessions: {html.escape(','.join(sorted(CONFIG.get('auto_catch_sessions', []))))}"
+        f"Auto Catch Sessions: {html.escape(','.join(sorted(CONFIG.get('auto_catch_sessions', []))))}\n"
+        f"Captcha Solver: {'✅ ON' if CONFIG.get('captcha_solver_enabled') else '❌ OFF'} | "
+        f"Captcha Auto: {'✅ ON' if CONFIG.get('captcha_auto_approve') else '❌ OFF'}"
     )
 
     await m.reply(msg, parse_mode=ParseMode.HTML)
@@ -1593,6 +2322,13 @@ async def send_help(m) -> None:
         "• <code>redit [emoji] [new_name]</code> - edit rarity name\n"
         "• <code>rarity on [emoji]</code> - forward rarity\n"
         "• <code>rarity off [emoji]</code> - ignore rarity\n\n"
+        "<b>Captcha Solver:</b>\n"
+        "• <code>/captcha_auto_on</code> - detected answer ကို auto click\n"
+        "• <code>/captcha_auto_off</code> - approval mode ပြန်သုံး\n"
+        "• <code>/captcha_auto_status</code> - captcha solver status\n"
+        "• <code>/captcha_pending</code> or <code>/pending</code> - pending captcha list\n"
+        "• <code>/approve</code> or <code>/approve_id ID</code> - approve and click\n"
+        "• <code>/reject</code> or <code>/reject ID</code> - reject captcha\n\n"
         "<b>History / Test:</b>\n"
         "• <code>history</code> - list dates\n"
         "• <code>YYYY-MM-DD</code> - show date history\n"
@@ -1805,6 +2541,60 @@ async def handle_owner_command(_, m) -> None:
             await send_help(m)
             return
 
+        if cmd == "/captcha_auto_on":
+            CONFIG["captcha_auto_approve"] = True
+            await m.reply("✅ Captcha auto approve is now ON.")
+            return
+
+        if cmd == "/captcha_auto_off":
+            CONFIG["captcha_auto_approve"] = False
+            await m.reply("❌ Captcha auto approve is now OFF. Bot will ask approval before clicking.")
+            return
+
+        if cmd == "/captcha_auto_status":
+            async with captcha_lock:
+                pending_count = len(pending_captchas)
+
+            await m.reply(
+                "🧩 <b>Captcha Solver Status</b>\n"
+                f"Enabled: {'✅ ON' if CONFIG.get('captcha_solver_enabled') else '❌ OFF'}\n"
+                f"Auto approve: {'✅ ON' if CONFIG.get('captcha_auto_approve') else '❌ OFF'}\n"
+                f"Solver sessions: <code>{html.escape(','.join(sorted(CONFIG.get('captcha_solver_sessions', []))))}</code>\n"
+                f"Target groups: <code>{html.escape(format_id_list(CONFIG.get('captcha_target_groups', set())))}</code>\n"
+                f"Captcha bot id: <code>{html.escape(str(CONFIG.get('captcha_bot_id')))}</code>\n"
+                f"Min confidence: <code>{CONFIG.get('captcha_min_confidence'):.2f}</code>\n"
+                f"Auto min confidence: <code>{CONFIG.get('captcha_auto_min_confidence'):.2f}</code>\n"
+                f"Auto methods: <code>{html.escape(','.join(sorted(CONFIG.get('captcha_auto_approve_methods', []))))}</code>\n"
+                f"Tesseract: {'✅' if CONFIG.get('enable_tesseract_ocr') else '❌'} | "
+                f"EasyOCR: {'✅' if CONFIG.get('enable_easyocr') else '❌'}\n"
+                f"OpenCV ready: {'✅' if captcha_cv_ready() else '❌'}\n"
+                f"Pending: <code>{pending_count}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if cmd in {"/captcha_pending", "/pending"}:
+            await send_captcha_pending(m)
+            return
+
+        if cmd == "/approve":
+            await approve_captcha_request(m)
+            return
+
+        if cmd == "/approve_id":
+            parts = text.split()
+            if len(parts) < 2 or not parts[1].isdigit():
+                await m.reply("❌ Usage: <code>/approve_id REQUEST_ID</code>", parse_mode=ParseMode.HTML)
+                return
+            await approve_captcha_request(m, int(parts[1]))
+            return
+
+        if cmd == "/reject":
+            parts = text.split()
+            request_id = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+            await reject_captcha_request(m, request_id)
+            return
+
         if text_lower in {"yat", "pause"}:
             auto_forward_paused = True
             auto_forward_error = False
@@ -2014,6 +2804,7 @@ async def handle_general_message(app: Client, session_key: str, m) -> None:
     try:
         await handle_spawn_alert(app, m, session_key)
         await handle_responder_dm(app, session_key, m)
+        await handle_captcha_solver(app, session_key, m)
         await handle_auto_forward_spawn(app, session_key, m)
         await handle_fail_new_message(app, session_key, m)
     except Exception as e:
@@ -2107,6 +2898,7 @@ async def send_startup_summary() -> None:
         f"Session B: <code>{session_b_id}</code>\n"
         f"Auto Forward: {'✅ ON' if CONFIG.get('auto_forward_enabled') else '❌ OFF'}\n"
         f"Auto Catch Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('auto_catch_sessions', []))))}</code>\n"
+        f"Captcha Solver: {'✅ ON' if CONFIG.get('captcha_solver_enabled') else '❌ OFF'} | Auto: {'✅ ON' if CONFIG.get('captcha_auto_approve') else '❌ OFF'}\n"
         f"Total Source Groups: {len(SOURCE_GROUPS_CONFIG)} | Active: {len(enabled_source_groups)}\n"
         f"Total Rarities: {len(RARITY_CONFIG)} | Forward: {len(enabled_rarities)}\n"
         f"Timezone: <code>{html.escape(TZ_NAME)}</code>\n"
@@ -2176,10 +2968,14 @@ async def main() -> None:
 
     await send_startup_summary()
 
+    captcha_cleanup_task = asyncio.create_task(captcha_cleanup_loop())
+
     try:
         await idle()
     finally:
         stop_active_timer()
+        if 'captcha_cleanup_task' in locals() and captcha_cleanup_task and not captcha_cleanup_task.done():
+            captcha_cleanup_task.cancel()
         await shutdown_clients()
 
 
