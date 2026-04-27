@@ -943,81 +943,100 @@ def _is_copy_hint_button(btn) -> bool:
     return "hint" in text and ("copy" in text or text.strip() == "hint")
 
 
-def extract_catch_command_from_copy_hint_button(m) -> Optional[str]:
+def extract_hint_line_command_only(response_text: str) -> Optional[str]:
     """
-    ONLY read the command from the Copy Hint inline button.
+    STRICT requested mode:
+    - Use ONLY the responder message text line that contains "Hint".
+    - Take EVERYTHING after "Hint :" on that same line.
+    - Do NOT use Full line.
+    - Do NOT use any random /catch fallback.
 
-    Requested behavior:
-      - Do NOT use message text.
-      - Do NOT use Full line/button.
-      - Find button whose visible text contains 'Copy Hint'.
-      - Read that button's copy_text payload and send only that value.
-
-    If the current Pyrogram layer cannot expose CopyTextButton payload,
-    this returns None and debug_copy_hint_buttons() will show it.
+    Example:
+      ❤ Hint : /catch Euphemia  ->  /catch Euphemia
+      ❤️ Hint: /catch Douma     ->  /catch Douma
     """
-    try:
-        markup = getattr(m, "reply_markup", None)
-        keyboard = getattr(markup, "inline_keyboard", None)
-        if not keyboard:
-            return None
+    text = strip_invisible(response_text or "")
+    if not text:
+        return None
 
-        for row in keyboard:
-            for btn in row:
-                if not _is_copy_hint_button(btn):
-                    continue
+    text = (
+        text.replace("：", ":")
+        .replace("﹕", ":")
+        .replace("꞉", ":")
+        .replace("ꓽ", ":")
+    )
 
-                candidate_objects = []
-                for attr in ("copy_text", "copyText"):
-                    try:
-                        v = getattr(btn, attr, None)
-                    except Exception:
-                        v = None
-                    if v is not None:
-                        candidate_objects.append(v)
+    for raw_line in text.splitlines():
+        line = strip_invisible(raw_line).strip()
+        if not line:
+            continue
+        line = (
+            line.replace("：", ":")
+            .replace("﹕", ":")
+            .replace("꞉", ":")
+            .replace("ꓽ", ":")
+        )
 
-                # Still only inside the Copy Hint button object.
-                candidate_objects.append(btn)
+        # Allow any emoji/symbols before Hint. Capture only after Hint :
+        # Examples: "❤ Hint : /catch Euphemia", "❤️ Hint: /catch Douma"
+        match = re.search(r"Hint\s*:\s*(.+)$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
 
-                for obj in candidate_objects:
-                    for value in _object_to_strings(obj):
-                        cmd = extract_catch_command(value)
-                        if cmd:
-                            return cmd
-    except Exception as e:
-        logging.warning("extract_catch_command_from_copy_hint_button failed: %s", e)
+        after_hint = match.group(1).strip()
+        cmd = clean_catch_command(after_hint)
+        if cmd:
+            return cmd
 
     return None
 
 
-def debug_copy_hint_buttons(m) -> str:
-    """Short debug summary for Copy Hint button availability."""
+def extract_catch_command_from_copy_hint_button(m) -> Optional[str]:
+    """
+    Compatibility name kept for old handler calls.
+
+    Actual behavior now follows the requested exact rule:
+    read ONLY the visible responder text line after "Hint :".
+
+    Reason:
+    Telegram's Copy Hint button is a client-side copy button. In Pyrogram 2.0.106,
+    the hidden copy_text payload is often not exposed to userbot code, so relying
+    on the button payload alone can never send anything. The visible Hint line is
+    the reliable source.
+    """
     try:
-        markup = getattr(m, "reply_markup", None)
-        keyboard = getattr(markup, "inline_keyboard", None)
-        if not keyboard:
-            return "NO_INLINE_KEYBOARD"
-
-        lines: list[str] = []
-        for r_idx, row in enumerate(keyboard):
-            for c_idx, btn in enumerate(row):
-                visible = _button_visible_text(btn)
-                if not _is_copy_hint_button(btn):
-                    continue
-                strings = _object_to_strings(btn, max_depth=3)
-                preview_values = []
-                for s in strings:
-                    if "/catch" in s or "catch" in s.lower() or "hint" in s.lower():
-                        s = re.sub(r"\s+", " ", s).strip()
-                        preview_values.append(s[:160])
-                preview = " | ".join(preview_values[:4]) or "COPY_HINT_FOUND_BUT_NO_TEXT_PAYLOAD"
-                lines.append(f"row={r_idx} col={c_idx} text={visible!r} data={preview}")
-        return "\n".join(lines) if lines else "NO_COPY_HINT_BUTTON"
+        return extract_hint_line_command_only(get_responder_message_text(m))
     except Exception as e:
-        return f"DEBUG_BUTTON_ERROR: {e}"
+        logging.warning("extract_hint_line_command_only failed: %s", e)
+        return None
 
 
-# Backward-compatible name. From now on this intentionally checks Copy Hint only.
+def debug_copy_hint_buttons(m) -> str:
+    """Debug summary for strict Hint-line mode."""
+    try:
+        text = get_responder_message_text(m)
+        if not text:
+            return "NO_TEXT_YET"
+
+        hint_lines = []
+        for raw_line in text.splitlines():
+            line = strip_invisible(raw_line).strip()
+            if "hint" in normalize_text(line):
+                hint_lines.append(line[:250])
+
+        cmd = extract_hint_line_command_only(text)
+        if cmd:
+            return "HINT_LINE_FOUND => " + cmd
+
+        if hint_lines:
+            return "HINT_LINE_SEEN_BUT_NO_COMMAND => " + " | ".join(hint_lines[:3])
+
+        return "NO_HINT_LINE_FOUND | text_preview=" + re.sub(r"\s+", " ", text)[:350]
+    except Exception as e:
+        return f"DEBUG_HINT_LINE_ERROR: {e}"
+
+
+# Backward-compatible name. From now on this intentionally checks Hint line only.
 def extract_catch_command_from_buttons(m) -> Optional[str]:
     return extract_catch_command_from_copy_hint_button(m)
 
@@ -1648,7 +1667,7 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
         is_bot_sender = bool(m.from_user and m.from_user.is_bot)
 
         response_text = get_responder_message_text(m)
-        # Copy Hint only mode: do not parse message text or Full line anymore.
+        # Hint-line only mode: use only the visible Hint : line; ignore Full line and fallbacks.
         catch_command = extract_catch_command_from_copy_hint_button(m)
 
         # Waifu Cheat Bot can reply slowly. Sometimes the first DM event is empty,
@@ -1687,7 +1706,7 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                                 continue
 
                             candidate_text = get_responder_message_text(candidate)
-                            # Copy Hint only mode: do not parse message text or Full line anymore.
+                            # Hint-line only mode: use only the visible Hint : line; ignore Full line and fallbacks.
                             candidate_command = extract_catch_command_from_copy_hint_button(candidate)
 
                             if candidate_command:
@@ -1703,7 +1722,7 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                             "🔁 <b>Delayed responder command found</b>\n"
                             f"Session: <code>{html.escape(session_key)}</code>\n"
                             f"Command: <code>{html.escape(catch_command)}</code>\n"
-                            f"Source: <code>Copy Hint button</code>",
+                            f"Source: <code>Hint line</code>",
                             parse_html=True,
                             app=app,
                         )
@@ -1720,8 +1739,8 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                 f"From: <code>{html.escape(str(sender_id))}</code>\n"
                 f"Known responder: <code>{html.escape(str(is_known_responder))}</code>\n"
                 f"Command: <code>{html.escape(str(catch_command or 'NOT_FOUND'))}</code>\n"
-                f"Copy Hint Button:\n<code>{html.escape(debug_copy_hint_buttons(m)[:900])}</code>\n"
-                f"Text ignored intentionally. Copy Hint only mode is active.",
+                f"Hint Line Debug:\n<code>{html.escape(debug_copy_hint_buttons(m)[:900])}</code>\n"
+                f"Only Hint : line is used. Full line and random /catch fallback are ignored.",
                 parse_html=True,
                 app=app,
             )
