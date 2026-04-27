@@ -25,6 +25,20 @@ except Exception:
     cv2 = None
     np = None
 
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+except Exception:
+    AsyncIOMotorClient = None
+
+try:
+    from PIL import Image
+    import imagehash
+except Exception:
+    Image = None
+    imagehash = None
+
+import hashlib
+
 # Important for PM2 / old environment cache
 load_dotenv(override=True)
 
@@ -111,8 +125,6 @@ processed_lock = asyncio.Lock()
 
 # Responder DM duplicate protection
 responder_dm_seen: set[Tuple[str, int, int]] = set()
-# Retry protection for responder bots that answer/edit after delay
-responder_retry_seen: set[Tuple[str, int, int]] = set()
 responder_dm_lock = asyncio.Lock()
 
 db_conn: Optional[sqlite3.Connection] = None
@@ -124,6 +136,10 @@ captcha_message_to_request: dict[Tuple[str, int, int], int] = {}
 captcha_lock = asyncio.Lock()
 processed_captcha_messages: set[Tuple[str, int, int]] = set()
 easyocr_reader = None
+
+# Direct MongoDB catch system
+direct_mongo_client = None
+direct_items_collection = None
 
 def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
@@ -265,6 +281,7 @@ def load_config() -> dict:
     log_group_id = getenv_optional_int("LOG_GROUP_ID", default=next(iter(group_ids)))
 
     auto_forward_enabled = getenv_bool("AUTO_FORWARD_ENABLED", False)
+    direct_db_catch_enabled = getenv_bool("DIRECT_DB_CATCH_ENABLED", False)
     bot_id = getenv_optional_int("BOT_ID")
 
     # Forward target bot. Keep RESPONDER_BOT_ID as default target.
@@ -280,8 +297,8 @@ def load_config() -> dict:
     if auto_forward_enabled:
         if bot_id is None:
             raise RuntimeError("BOT_ID is required when AUTO_FORWARD_ENABLED=true")
-        if responder_bot_id is None and not responder_bot_ids:
-            raise RuntimeError("RESPONDER_BOT_ID or RESPONDER_BOT_IDS is required when AUTO_FORWARD_ENABLED=true")
+        if not direct_db_catch_enabled and responder_bot_id is None and not responder_bot_ids:
+            raise RuntimeError("RESPONDER_BOT_ID or RESPONDER_BOT_IDS is required when AUTO_FORWARD_ENABLED=true, unless DIRECT_DB_CATCH_ENABLED=true")
 
     catch_min_delay = getenv_float("CATCH_MIN_DELAY", 2.0)
     catch_max_delay = getenv_float("CATCH_MAX_DELAY", 3.0)
@@ -335,6 +352,27 @@ def load_config() -> dict:
         "enable_easyocr": getenv_bool("ENABLE_EASYOCR", False),
         "captcha_log_no_answer": getenv_bool("CAPTCHA_LOG_NO_ANSWER", True),
         "captcha_debug_save": getenv_bool("CAPTCHA_DEBUG_SAVE", False),
+
+        # Direct MongoDB catch lookup. This bypasses responder bot reply parsing.
+        "direct_db_catch_enabled": direct_db_catch_enabled,
+        "direct_db_mongo_uri": os.getenv("DIRECT_DB_MONGO_URI", os.getenv("MONGO_URI", "")).strip(),
+        "direct_db_name": os.getenv("DIRECT_DB_NAME", os.getenv("DB_NAME", "")).strip(),
+        "direct_db_collection": os.getenv("DIRECT_DB_COLLECTION", os.getenv("MEDIA_COLLECTION", "items")).strip() or "items",
+        "direct_db_sessions": parse_session_keys(os.getenv("DIRECT_DB_CATCH_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a")), "a"),
+        "direct_db_command_name": os.getenv("DIRECT_DB_COMMAND_NAME", "/catch").strip() or "/catch",
+        "direct_db_source_bot_key": os.getenv("DIRECT_DB_SOURCE_BOT_KEY", "catcher").strip() or "catcher",
+        "direct_db_use_file_unique_id": getenv_bool("DIRECT_DB_USE_FILE_UNIQUE_ID", True),
+        "direct_db_use_sha256": getenv_bool("DIRECT_DB_USE_SHA256", True),
+        "direct_db_use_phash": getenv_bool("DIRECT_DB_USE_PHASH", False),
+        "direct_db_phash_threshold": getenv_int("DIRECT_DB_PHASH_THRESHOLD", 8),
+        "direct_db_phash_scan_limit": getenv_int("DIRECT_DB_PHASH_SCAN_LIMIT", 5000),
+        "direct_db_name_mode": os.getenv("DIRECT_DB_CATCH_NAME_MODE", "hint").strip().lower() or "hint",
+        "direct_db_command_field": os.getenv("DIRECT_DB_CATCH_COMMAND_FIELD", "command").strip() or "command",
+        "direct_db_hint_field": os.getenv("DIRECT_DB_CATCH_HINT_FIELD", "hint").strip() or "hint",
+        "direct_db_name_field": os.getenv("DIRECT_DB_CATCH_NAME_FIELD", "name").strip() or "name",
+        "direct_db_fallback_to_responder": getenv_bool("DIRECT_DB_FALLBACK_TO_RESPONDER", False),
+        "direct_db_delete_catch_command": getenv_bool("DIRECT_DB_DELETE_CATCH_COMMAND", getenv_bool("AUTO_DELETE_CATCH_COMMAND", True)),
+        "direct_db_debug": getenv_bool("DIRECT_DB_DEBUG", True),
     }
 
 def setup_logging(debug: bool) -> None:
@@ -764,77 +802,32 @@ def strip_invisible(text: str) -> str:
 
 
 def clean_catch_command(cmd: str) -> str:
-    """Clean only the command part, preserving the real name after /catch."""
-    cmd = strip_invisible(cmd or "")
+    cmd = strip_invisible(cmd)
     cmd = cmd.replace("`", "").replace("<code>", "").replace("</code>", "")
-    cmd = (
-        cmd.replace("：", ":")
-        .replace("﹕", ":")
-        .replace("꞉", ":")
-        .replace("ꓽ", ":")
-    )
     cmd = re.sub(r"\s+", " ", cmd).strip()
 
-    # If extra footer text was accidentally captured, cut it.
+    # Stop at button/footer/noise lines if accidentally captured.
     cmd = re.split(
-        r"\s+(?:Full\s*:|Hint\s*:|Powered\b|Copy\b|Official\b|NAME\s*:)",
+        r"\s+(?:Full|Powered|Copy|Official|Hint|NAME)\b",
         cmd,
         maxsplit=1,
         flags=re.IGNORECASE,
     )[0].strip()
 
-    # Keep only text starting from /catch.
-    match = re.search(r"/catch(?:@\w+)?\s+.+", cmd, flags=re.IGNORECASE)
-    if not match:
-        match = re.search(r"/catch(?:@\w+)?(?:\s*)", cmd, flags=re.IGNORECASE)
-    if not match:
+    if not cmd.lower().startswith("/catch"):
         return ""
-
-    cmd = match.group(0).strip()
-    return cmd if cmd.lower().startswith("/catch") else ""
-
-
-def _extract_after_label_line(text: str, label: str) -> Optional[str]:
-    """
-    EXACT Waifu format support:
-      ❤ Hint : /catch Euphemia
-    This returns everything after 'Hint :' on that same line.
-    """
-    for raw_line in (text or "").splitlines():
-        line = strip_invisible(raw_line).strip()
-        if not line:
-            continue
-
-        line = (
-            line.replace("：", ":")
-            .replace("﹕", ":")
-            .replace("꞉", ":")
-            .replace("ꓽ", ":")
-        )
-
-        # Allow emoji/symbols before label, and spaces around colon.
-        # Examples: "❤️ Hint: /catch Douma", "❤ Hint : /catch Euphemia"
-        match = re.search(rf"(?:^|\s){re.escape(label)}\s*:\s*(.+)$", line, flags=re.IGNORECASE)
-        if not match:
-            continue
-
-        after_label = match.group(1).strip()
-        cmd = clean_catch_command(after_label)
-        if cmd:
-            return cmd
-
-    return None
+    return cmd
 
 
 def extract_catch_command(response_text: str) -> Optional[str]:
     """
-    Extract /catch command from responder bot reply.
-
-    Priority:
-    1) Take EVERYTHING after 'Hint :' on the same line.
-       Example: '❤ Hint : /catch Euphemia' -> '/catch Euphemia'
-    2) If Hint is absent, take everything after 'Full :'.
-    3) Fallback: first /catch line anywhere in text.
+    Robustly extract catch command from responder bot reply.
+    Supports:
+      ❤️ Hint: /catch Douma
+      Hint : /catch Douma
+      Hint：/catch Douma
+      Full: /catch Name [Extra]
+      Any fallback /catch line
     """
     text = strip_invisible(response_text or "")
     if not text:
@@ -847,198 +840,52 @@ def extract_catch_command(response_text: str) -> Optional[str]:
         .replace("ꓽ", ":")
     )
 
-    # 1) Exact requested behavior: use Hint line first.
-    cmd = _extract_after_label_line(text, "Hint")
-    if cmd:
-        return cmd
+    patterns = [
+        r"(?:^|\n)[^\n]{0,60}?Hint\s*:\s*(/catch[^\n\r]+)",
+        r"(?:^|\n)[^\n]{0,60}?Full\s*:\s*(/catch[^\n\r]+)",
+        r"(/catch[^\n\r]+)",
+    ]
 
-    # 2) Fallback to Full line.
-    cmd = _extract_after_label_line(text, "Full")
-    if cmd:
-        return cmd
-
-    # 3) Last fallback: any /catch until the end of its line.
-    match = re.search(r"(/catch(?:@\w+)?[^\n\r]*)", text, flags=re.IGNORECASE)
-    if match:
-        cmd = clean_catch_command(match.group(1))
-        if cmd:
-            return cmd
-
-    return None
-
-def _object_to_strings(obj, *, max_depth: int = 4, _seen: Optional[set[int]] = None) -> list[str]:
-    """
-    Safely collect text fields from Pyrogram/raw button objects.
-    CopyTextButton payload can be exposed differently depending on Pyrogram/Telegram layer:
-    btn.copy_text.text, raw text field, __dict__, or repr().
-    """
-    if obj is None:
-        return []
-
-    if _seen is None:
-        _seen = set()
-
-    oid = id(obj)
-    if oid in _seen or max_depth < 0:
-        return []
-    _seen.add(oid)
-
-    if isinstance(obj, (str, bytes, int, float, bool)):
-        if isinstance(obj, bytes):
-            try:
-                return [obj.decode("utf-8", errors="ignore")]
-            except Exception:
-                return []
-        return [str(obj)]
-
-    values: list[str] = []
-
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            values.extend(_object_to_strings(k, max_depth=max_depth - 1, _seen=_seen))
-            values.extend(_object_to_strings(v, max_depth=max_depth - 1, _seen=_seen))
-        return values
-
-    if isinstance(obj, (list, tuple, set)):
-        for item in obj:
-            values.extend(_object_to_strings(item, max_depth=max_depth - 1, _seen=_seen))
-        return values
-
-    try:
-        d = getattr(obj, "__dict__", None)
-        if isinstance(d, dict):
-            values.extend(_object_to_strings(d, max_depth=max_depth - 1, _seen=_seen))
-    except Exception:
-        pass
-
-    for attr in (
-        "text", "copy_text", "copyText", "copy_text_text", "button", "buttons",
-        "data", "url", "query", "same_peer", "placeholder",
-    ):
-        try:
-            v = getattr(obj, attr, None)
-        except Exception:
-            v = None
-        if v is not None:
-            values.extend(_object_to_strings(v, max_depth=max_depth - 1, _seen=_seen))
-
-    try:
-        values.append(repr(obj))
-    except Exception:
-        pass
-
-    return values
-
-
-def _button_visible_text(btn) -> str:
-    try:
-        return strip_invisible(str(getattr(btn, "text", "") or ""))
-    except Exception:
-        return ""
-
-
-def _is_copy_hint_button(btn) -> bool:
-    text = normalize_text(_button_visible_text(btn))
-    # Examples: "📋 Copy Hint", "Copy Hint", "hint"
-    return "hint" in text and ("copy" in text or text.strip() == "hint")
-
-
-def extract_hint_line_command_only(response_text: str) -> Optional[str]:
-    """
-    STRICT requested mode:
-    - Use ONLY the responder message text line that contains "Hint".
-    - Take EVERYTHING after "Hint :" on that same line.
-    - Do NOT use Full line.
-    - Do NOT use any random /catch fallback.
-
-    Example:
-      ❤ Hint : /catch Euphemia  ->  /catch Euphemia
-      ❤️ Hint: /catch Douma     ->  /catch Douma
-    """
-    text = strip_invisible(response_text or "")
-    if not text:
-        return None
-
-    text = (
-        text.replace("：", ":")
-        .replace("﹕", ":")
-        .replace("꞉", ":")
-        .replace("ꓽ", ":")
-    )
-
-    for raw_line in text.splitlines():
-        line = strip_invisible(raw_line).strip()
-        if not line:
-            continue
-        line = (
-            line.replace("：", ":")
-            .replace("﹕", ":")
-            .replace("꞉", ":")
-            .replace("ꓽ", ":")
-        )
-
-        # Allow any emoji/symbols before Hint. Capture only after Hint :
-        # Examples: "❤ Hint : /catch Euphemia", "❤️ Hint: /catch Douma"
-        match = re.search(r"Hint\s*:\s*(.+)$", line, flags=re.IGNORECASE)
-        if not match:
-            continue
-
-        after_hint = match.group(1).strip()
-        cmd = clean_catch_command(after_hint)
-        if cmd:
-            return cmd
-
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            cmd = clean_catch_command(match.group(1))
+            if cmd:
+                return cmd
     return None
 
 
-def extract_catch_command_from_copy_hint_button(m) -> Optional[str]:
-    """
-    Compatibility name kept for old handler calls.
-
-    Actual behavior now follows the requested exact rule:
-    read ONLY the visible responder text line after "Hint :".
-
-    Reason:
-    Telegram's Copy Hint button is a client-side copy button. In Pyrogram 2.0.106,
-    the hidden copy_text payload is often not exposed to userbot code, so relying
-    on the button payload alone can never send anything. The visible Hint line is
-    the reliable source.
-    """
-    try:
-        return extract_hint_line_command_only(get_responder_message_text(m))
-    except Exception as e:
-        logging.warning("extract_hint_line_command_only failed: %s", e)
-        return None
-
-
-def debug_copy_hint_buttons(m) -> str:
-    """Debug summary for strict Hint-line mode."""
-    try:
-        text = get_responder_message_text(m)
-        if not text:
-            return "NO_TEXT_YET"
-
-        hint_lines = []
-        for raw_line in text.splitlines():
-            line = strip_invisible(raw_line).strip()
-            if "hint" in normalize_text(line):
-                hint_lines.append(line[:250])
-
-        cmd = extract_hint_line_command_only(text)
-        if cmd:
-            return "HINT_LINE_FOUND => " + cmd
-
-        if hint_lines:
-            return "HINT_LINE_SEEN_BUT_NO_COMMAND => " + " | ".join(hint_lines[:3])
-
-        return "NO_HINT_LINE_FOUND | text_preview=" + re.sub(r"\s+", " ", text)[:350]
-    except Exception as e:
-        return f"DEBUG_HINT_LINE_ERROR: {e}"
-
-
-# Backward-compatible name. From now on this intentionally checks Hint line only.
 def extract_catch_command_from_buttons(m) -> Optional[str]:
-    return extract_catch_command_from_copy_hint_button(m)
+    """Try to read /catch from inline keyboard/copy-text buttons when text parsing fails."""
+    try:
+        markup = getattr(m, "reply_markup", None)
+        keyboard = getattr(markup, "inline_keyboard", None)
+        if not keyboard:
+            return None
+
+        for row in keyboard:
+            for btn in row:
+                values = []
+                for attr in ("text", "url", "callback_data"):
+                    value = getattr(btn, attr, None)
+                    if value:
+                        values.append(str(value))
+
+                copy_text = getattr(btn, "copy_text", None)
+                if copy_text:
+                    values.append(str(copy_text))
+                    value = getattr(copy_text, "text", None)
+                    if value:
+                        values.append(str(value))
+
+                for value in values:
+                    cmd = extract_catch_command(value)
+                    if cmd:
+                        return cmd
+    except Exception as e:
+        logging.warning("extract_catch_command_from_buttons failed: %s", e)
+
+    return None
 
 
 def is_success_message(message_text: str) -> bool:
@@ -1475,24 +1322,6 @@ def get_message_text(m) -> str:
     return m.text or m.caption or ""
 
 
-def get_responder_message_text(m) -> str:
-    """Return all text-like fields from responder messages. Some bot messages arrive empty first and are later edited."""
-    parts: list[str] = []
-    for attr in ("text", "caption"):
-        value = getattr(m, attr, None)
-        if value:
-            parts.append(str(value))
-
-    reply = getattr(m, "reply_to_message", None)
-    if reply:
-        for attr in ("text", "caption"):
-            value = getattr(reply, attr, None)
-            if value:
-                parts.append(str(value))
-
-    return "\n".join(parts)
-
-
 async def handle_attention_log(app: Client, m, session_key: str) -> bool:
     message_text = get_message_text(m)
     if not is_attention_text(message_text):
@@ -1517,6 +1346,334 @@ async def handle_attention_log(app: Client, m, session_key: str) -> bool:
     return True
 
 
+
+# =========================
+# DIRECT MONGODB CATCH LOOKUP
+# =========================
+
+def direct_db_base_filter() -> dict[str, Any]:
+    return {
+        "$or": [
+            {"command_name": CONFIG.get("direct_db_command_name", "/catch")},
+            {"source_bot_key": CONFIG.get("direct_db_source_bot_key", "catcher")},
+        ]
+    }
+
+
+def get_media_object_and_type(m) -> tuple[Optional[Any], Optional[str]]:
+    media_fields = [
+        ("photo", "photo"),
+        ("video", "video"),
+        ("animation", "animation"),
+        ("document", "document"),
+        ("sticker", "sticker"),
+    ]
+    for attr, media_type in media_fields:
+        media_obj = getattr(m, attr, None)
+        if media_obj:
+            return media_obj, media_type
+    return None, None
+
+
+def get_media_file_unique_id(m) -> Optional[str]:
+    media_obj, _ = get_media_object_and_type(m)
+    if not media_obj:
+        return None
+    return getattr(media_obj, "file_unique_id", None)
+
+
+async def download_media_bytes(app: Client, m) -> Optional[bytes]:
+    try:
+        data = await app.download_media(m, in_memory=True)
+    except Exception as e:
+        logging.warning("direct db download_media failed: %s", e)
+        return None
+
+    if not data:
+        return None
+
+    if isinstance(data, BytesIO):
+        return data.getvalue()
+    if hasattr(data, "getbuffer"):
+        return bytes(data.getbuffer())
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    return None
+
+
+def sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def compute_photo_phash_from_bytes(raw: bytes) -> Optional[str]:
+    if Image is None or imagehash is None:
+        return None
+    try:
+        img = Image.open(BytesIO(raw)).convert("RGB")
+        return str(imagehash.phash(img))
+    except Exception as e:
+        logging.debug("compute phash failed: %s", e)
+        return None
+
+
+def hamming_hex_hash(a: str, b: str) -> int:
+    try:
+        return bin(int(str(a), 16) ^ int(str(b), 16)).count("1")
+    except Exception:
+        return 999
+
+
+async def init_direct_db() -> None:
+    global direct_mongo_client, direct_items_collection
+
+    if not CONFIG.get("direct_db_catch_enabled"):
+        return
+
+    if AsyncIOMotorClient is None:
+        await send_log("❌ Direct DB catch enabled but <code>motor</code> is not installed.", parse_html=True)
+        return
+
+    mongo_uri = CONFIG.get("direct_db_mongo_uri", "")
+    db_name = CONFIG.get("direct_db_name", "")
+    collection_name = CONFIG.get("direct_db_collection", "items")
+
+    if not mongo_uri or not db_name:
+        await send_log(
+            "❌ Direct DB catch enabled but MONGO_URI/DIRECT_DB_MONGO_URI or DB_NAME/DIRECT_DB_NAME is missing.",
+            parse_html=True,
+        )
+        return
+
+    try:
+        direct_mongo_client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        await direct_mongo_client.admin.command("ping")
+        direct_items_collection = direct_mongo_client[db_name][collection_name]
+
+        # Helpful indexes. Creating existing indexes is safe.
+        try:
+            await direct_items_collection.create_index("file_unique_id")
+            await direct_items_collection.create_index("sha256")
+            await direct_items_collection.create_index("phash")
+            await direct_items_collection.create_index([("command_name", 1), ("source_bot_key", 1)])
+        except Exception as idx_error:
+            logging.debug("direct db index create skipped/failed: %s", idx_error)
+
+        await send_log(
+            "✅ <b>Direct DB catch connected</b>\n"
+            f"DB: <code>{html.escape(db_name)}</code>\n"
+            f"Collection: <code>{html.escape(collection_name)}</code>\n"
+            f"Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('direct_db_sessions', []))))}</code>",
+            parse_html=True,
+        )
+    except Exception as e:
+        direct_items_collection = None
+        logging.warning("init_direct_db failed: %s", e)
+        await send_log(f"❌ Direct DB catch connect failed: <code>{html.escape(str(e))}</code>", parse_html=True)
+
+
+async def direct_db_find_item(app: Client, m) -> tuple[Optional[dict[str, Any]], str]:
+    if direct_items_collection is None:
+        return None, "db_not_ready"
+
+    base_filter = direct_db_base_filter()
+    projection = {
+        "name": 1,
+        "hint": 1,
+        "command": 1,
+        "catch_command": 1,
+        "command_name": 1,
+        "source_bot_key": 1,
+        "media_type": 1,
+        "file_unique_id": 1,
+        "sha256": 1,
+        "phash": 1,
+        "frame_hashes": 1,
+        "card_id": 1,
+        "anime_name": 1,
+    }
+
+    file_unique_id = get_media_file_unique_id(m)
+    if CONFIG.get("direct_db_use_file_unique_id", True) and file_unique_id:
+        doc = await direct_items_collection.find_one(
+            {"$and": [base_filter, {"file_unique_id": file_unique_id}]},
+            projection,
+        )
+        if doc:
+            return doc, "file_unique_id"
+
+    raw = None
+    if CONFIG.get("direct_db_use_sha256", True) or CONFIG.get("direct_db_use_phash", False):
+        raw = await download_media_bytes(app, m)
+
+    if CONFIG.get("direct_db_use_sha256", True) and raw:
+        digest = sha256_bytes(raw)
+        doc = await direct_items_collection.find_one(
+            {"$and": [base_filter, {"sha256": digest}]},
+            projection,
+        )
+        if doc:
+            return doc, "sha256"
+
+    # Optional slow fallback for photos only. Keep OFF by default for speed.
+    if CONFIG.get("direct_db_use_phash", False) and raw and getattr(m, "photo", None):
+        current_phash = compute_photo_phash_from_bytes(raw)
+        if current_phash:
+            threshold = int(CONFIG.get("direct_db_phash_threshold", 8))
+            scan_limit = int(CONFIG.get("direct_db_phash_scan_limit", 5000))
+            cursor = direct_items_collection.find(
+                {"$and": [base_filter, {"media_type": {"$in": ["photo", "image"]}}, {"phash": {"$exists": True, "$ne": None}}]},
+                projection,
+            ).limit(scan_limit)
+
+            best_doc = None
+            best_dist = 999
+            async for doc in cursor:
+                dist = hamming_hex_hash(current_phash, str(doc.get("phash", "")))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_doc = doc
+                if dist == 0:
+                    break
+
+            if best_doc and best_dist <= threshold:
+                best_doc["_phash_distance"] = best_dist
+                return best_doc, f"phash:{best_dist}"
+
+    return None, "not_found"
+
+
+def strip_name_decorations(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value or "")
+    value = re.sub(r"\[[^\]]*\]", " ", value)
+    value = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", value)
+    value = re.sub(r"[🏀🎮💠🔵🟠🟣🟡💮⚜️❓]+", " ", value)
+    return " ".join(value.split()).strip()
+
+
+def build_direct_catch_command(doc: dict[str, Any]) -> Optional[str]:
+    command_field = CONFIG.get("direct_db_command_field", "command")
+    hint_field = CONFIG.get("direct_db_hint_field", "hint")
+    name_field = CONFIG.get("direct_db_name_field", "name")
+    command_name = str(doc.get("command_name") or CONFIG.get("direct_db_command_name", "/catch") or "/catch").strip()
+    if not command_name.startswith("/"):
+        command_name = "/catch"
+
+    # 1) If DB already stores exact command, use it.
+    for key in [command_field, "catch_command", "command"]:
+        value = doc.get(key)
+        if isinstance(value, str) and value.strip().lower().startswith(command_name.lower()):
+            return clean_catch_command(value.strip()) or value.strip()
+
+    # 2) Prefer stored hint if available.
+    hint = str(doc.get(hint_field) or "").strip()
+    if hint:
+        hint = strip_name_decorations(hint)
+        if hint:
+            return f"{command_name} {hint}".strip()
+
+    # 3) Build from name. Default mode = first token/hint, because most catcher bots accept short hint.
+    name = strip_name_decorations(str(doc.get(name_field) or ""))
+    if not name:
+        return None
+
+    mode = CONFIG.get("direct_db_name_mode", "hint")
+    if mode in {"full", "name", "full_name"}:
+        value = name
+    else:
+        value = name.split()[0]
+
+    return f"{command_name} {value}".strip()
+
+
+async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optional[str], group_name: str) -> bool:
+    if not CONFIG.get("direct_db_catch_enabled"):
+        return False
+    if session_key not in CONFIG.get("direct_db_sessions", {"a"}):
+        return False
+
+    doc, method = await direct_db_find_item(app, m)
+    if not doc:
+        if CONFIG.get("direct_db_debug", True):
+            await send_log(
+                "🔎 <b>Direct DB no match</b>\n"
+                f"Session: <code>{html.escape(session_key)}</code>\n"
+                f"Method: <code>{html.escape(method)}</code>\n"
+                f"Group: {html.escape(group_name)}\n"
+                f"Group ID: <code>{m.chat.id}</code>",
+                parse_html=True,
+                app=app,
+            )
+        return False
+
+    catch_command = build_direct_catch_command(doc)
+    if not catch_command:
+        await send_log(
+            "❌ <b>Direct DB matched but command could not be built.</b>\n"
+            f"Match method: <code>{html.escape(method)}</code>\n"
+            f"Doc name: <code>{html.escape(str(doc.get('name')))}</code>",
+            parse_html=True,
+            app=app,
+        )
+        return False
+
+    try:
+        await asyncio.sleep(random.uniform(CONFIG["catch_min_delay"], CONFIG["catch_max_delay"]))
+        sent_message = await app.send_message(m.chat.id, catch_command)
+
+        pending_key = (session_key, -int(m.id))
+        await add_pending_response(
+            pending_key,
+            {
+                "session_key": session_key,
+                "forwarded_message_id": -int(m.id),
+                "original_message_id": m.id,
+                "original_chat_id": m.chat.id,
+                "character_name": str(doc.get("name") or "Unknown"),
+                "rarity": rarity,
+                "timestamp": now_local(),
+                "waiting_for_result": True,
+                "my_message_id": sent_message.id,
+                "catch_command": catch_command,
+                "direct_db": True,
+            },
+        )
+
+        await send_log(
+            "⚡ <b>Direct DB catch command sent</b>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Character: {html.escape(str(doc.get('name') or 'Unknown'))}\n"
+            f"Anime: {html.escape(str(doc.get('anime_name') or 'Unknown'))}\n"
+            f"Rarity: {html.escape(str(rarity or 'Unknown'))}\n"
+            f"Match: <code>{html.escape(method)}</code>\n"
+            f"Command: <code>{html.escape(catch_command)}</code>\n"
+            f"Group: {html.escape(group_name)}\n"
+            f"Group ID: <code>{m.chat.id}</code>\n"
+            f"⏰ Time: {html.escape(now_local_str('%H:%M:%S'))}",
+            parse_html=True,
+            app=app,
+        )
+
+        if CONFIG.get("direct_db_delete_catch_command", CONFIG.get("auto_delete_catch_command", True)):
+            asyncio.create_task(
+                delete_later(
+                    app,
+                    m.chat.id,
+                    sent_message.id,
+                    CONFIG.get("catch_delete_after_seconds", 1.0),
+                )
+            )
+
+        return True
+
+    except FloodWait as e:
+        logging.warning("Direct DB catch FloodWait: sleeping %s seconds", e.value)
+        await asyncio.sleep(e.value)
+        return True
+    except Exception as e:
+        logging.warning("Direct DB catch send failed: %s", e)
+        await send_log(f"❌ Direct DB catch send error: <code>{html.escape(str(e))}</code>", parse_html=True, app=app)
+        return True
+
 async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     if not CONFIG.get("auto_forward_enabled"):
         return
@@ -1530,7 +1687,10 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     bot_id = CONFIG.get("bot_id")
     responder_bot_id = CONFIG.get("responder_bot_id")
 
-    if not bot_id or not responder_bot_id:
+    if not bot_id:
+        return
+
+    if not responder_bot_id and not CONFIG.get("direct_db_catch_enabled"):
         return
 
     if not m.chat or not m.chat.id:
@@ -1584,6 +1744,13 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
             app=app,
         )
         return
+
+    if CONFIG.get("direct_db_catch_enabled"):
+        direct_sent = await handle_direct_db_catch(app, session_key, m, rarity, group_name)
+        if direct_sent:
+            return
+        if not CONFIG.get("direct_db_fallback_to_responder", False):
+            return
 
     try:
         forwarded = await app.forward_messages(
@@ -1640,12 +1807,12 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
     """
     Convert responder bot DM into /catch command in the original group.
 
-    Important Waifu Cheat Bot fixes:
-    - Waifu can send an empty/new message first, then EDIT the same message to add
-      NAME / Hint / Full. We only dedupe AFTER a /catch command is found.
-    - When the line is '❤ Hint : /catch Euphemia', the bot takes exactly the text
-      after 'Hint :' and sends only '/catch Euphemia'.
-    - Also refetches the same responder message a few times if the first event is empty.
+    Fixes for Waifu Cheat Bot:
+    - Accept ChatType.BOT and ChatType.PRIVATE.
+    - Broad early handler catches all messages; this function self-filters.
+    - Allows RESPONDER_BOT_IDS list, but can still process any bot DM that contains /catch.
+    - Reads /catch from message text and inline CopyTextButton fallback.
+    - Falls back to latest pending spawn when NAME does not match pending NAME placeholder.
     """
     try:
         if not CONFIG.get("auto_forward_enabled"):
@@ -1657,6 +1824,20 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
         if m.chat.type not in {ChatType.PRIVATE, ChatType.BOT}:
             return
 
+        # Deduplicate because this function is called from an early responder handler and general handler.
+        dedupe_key = (session_key, int(m.chat.id), int(m.id))
+        async with responder_dm_lock:
+            if dedupe_key in responder_dm_seen:
+                return
+            responder_dm_seen.add(dedupe_key)
+            if len(responder_dm_seen) > 3000:
+                responder_dm_seen.clear()
+
+        response_text = get_message_text(m)
+        catch_command = extract_catch_command(response_text)
+        if not catch_command:
+            catch_command = extract_catch_command_from_buttons(m)
+
         sender_id = m.from_user.id if m.from_user else None
         responder_ids = set(CONFIG.get("responder_bot_ids") or set())
         responder_bot_id = CONFIG.get("responder_bot_id")
@@ -1665,68 +1846,6 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
         is_known_responder = bool(sender_id and int(sender_id) in responder_ids)
         is_bot_sender = bool(m.from_user and m.from_user.is_bot)
-
-        response_text = get_responder_message_text(m)
-        # Hint-line only mode: use only the visible Hint : line; ignore Full line and fallbacks.
-        catch_command = extract_catch_command_from_copy_hint_button(m)
-
-        # Waifu Cheat Bot can reply slowly. Sometimes the first DM event is empty,
-        # then the bot edits it or sends another message with NAME / Hint / Full.
-        # Search the same message + recent responder DM history for up to ~35 sec.
-        if is_known_responder and not catch_command:
-            retry_key = (session_key, int(m.chat.id), int(m.id))
-            async with responder_dm_lock:
-                retry_allowed = retry_key not in responder_retry_seen
-                if retry_allowed:
-                    responder_retry_seen.add(retry_key)
-                    if len(responder_retry_seen) > 3000:
-                        responder_retry_seen.clear()
-
-            if retry_allowed:
-                for wait_seconds in (1.5, 2.5, 4.0, 6.0, 9.0, 12.0):
-                    await asyncio.sleep(wait_seconds)
-                    candidates = []
-                    try:
-                        fresh = await app.get_messages(m.chat.id, m.id)
-                        if fresh:
-                            candidates.append(fresh)
-                    except Exception:
-                        pass
-
-                    try:
-                        async for item in app.get_chat_history(m.chat.id, limit=12):
-                            candidates.append(item)
-                    except Exception:
-                        pass
-
-                    for candidate in candidates:
-                        try:
-                            candidate_sender = candidate.from_user.id if candidate.from_user else None
-                            if sender_id and candidate_sender and int(candidate_sender) != int(sender_id):
-                                continue
-
-                            candidate_text = get_responder_message_text(candidate)
-                            # Hint-line only mode: use only the visible Hint : line; ignore Full line and fallbacks.
-                            candidate_command = extract_catch_command_from_copy_hint_button(candidate)
-
-                            if candidate_command:
-                                m = candidate
-                                response_text = candidate_text
-                                catch_command = candidate_command
-                                break
-                        except Exception:
-                            continue
-
-                    if catch_command:
-                        await send_log(
-                            "🔁 <b>Delayed responder command found</b>\n"
-                            f"Session: <code>{html.escape(session_key)}</code>\n"
-                            f"Command: <code>{html.escape(catch_command)}</code>\n"
-                            f"Source: <code>Hint line</code>",
-                            parse_html=True,
-                            app=app,
-                        )
-                        break
 
         # Normal path: known responder bot. Fallback path: any bot DM containing /catch.
         if not is_known_responder and not (is_bot_sender and catch_command):
@@ -1739,25 +1858,13 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
                 f"From: <code>{html.escape(str(sender_id))}</code>\n"
                 f"Known responder: <code>{html.escape(str(is_known_responder))}</code>\n"
                 f"Command: <code>{html.escape(str(catch_command or 'NOT_FOUND'))}</code>\n"
-                f"Hint Line Debug:\n<code>{html.escape(debug_copy_hint_buttons(m)[:900])}</code>\n"
-                f"Only Hint : line is used. Full line and random /catch fallback are ignored.",
+                f"Text:\n<code>{html.escape((response_text or '')[:700])}</code>",
                 parse_html=True,
                 app=app,
             )
 
         if not catch_command:
-            # Do NOT mark this message as seen. It may be edited later, and
-            # handle_edited_message() can then process it.
             return
-
-        # Deduplicate only after command is actually found.
-        dedupe_key = (session_key, int(m.chat.id), int(m.id))
-        async with responder_dm_lock:
-            if dedupe_key in responder_dm_seen:
-                return
-            responder_dm_seen.add(dedupe_key)
-            if len(responder_dm_seen) > 3000:
-                responder_dm_seen.clear()
 
         normalized_response = unicodedata.normalize("NFKC", response_text or "")
         name_match = re.search(
@@ -1770,7 +1877,7 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
         pending_key, pending = await select_pending_response(session_key, character_name)
 
-        # Waifu replies have the real NAME while original post usually contains placeholder NAME.
+        # Waifu replies often have the real NAME while original post contains placeholder NAME.
         # If exact-name matching fails, use the latest non-waiting pending for this session.
         if not pending_key or not pending:
             await cleanup_stale_pending()
@@ -2718,7 +2825,9 @@ async def send_stats(m) -> None:
         f"Chat Loops Running: {len(running_chat_loops)}\n"
         f"Auto Catch Sessions: {html.escape(','.join(sorted(CONFIG.get('auto_catch_sessions', []))))}\n"
         f"Captcha Solver: {'✅ ON' if CONFIG.get('captcha_solver_enabled') else '❌ OFF'} | "
-        f"Captcha Auto: {'✅ ON' if CONFIG.get('captcha_auto_approve') else '❌ OFF'}"
+        f"Captcha Auto: {'✅ ON' if CONFIG.get('captcha_auto_approve') else '❌ OFF'}\n"
+        f"Direct DB Catch: {'✅ ON' if CONFIG.get('direct_db_catch_enabled') else '❌ OFF'} | "
+        f"Sessions: {html.escape(','.join(sorted(CONFIG.get('direct_db_sessions', []))))}"
     )
 
     await m.reply(msg, parse_mode=ParseMode.HTML)
@@ -3242,9 +3351,6 @@ async def handle_general_message(app: Client, session_key: str, m) -> None:
 
 async def handle_edited_message(app: Client, session_key: str, m) -> None:
     try:
-        # Waifu Cheat Bot may send an empty message first and then edit it with
-        # NAME / Hint / Full. Process responder edits before normal success edits.
-        await handle_responder_dm(app, session_key, m)
         await handle_success_edited(app, session_key, m)
     except Exception as e:
         logging.warning("handle_edited_message_%s failed: %s", session_key, e)
@@ -3308,6 +3414,9 @@ async def shutdown_clients() -> None:
     if db_conn is not None:
         db_conn.close()
 
+    if direct_mongo_client is not None:
+        direct_mongo_client.close()
+
 
 async def send_startup_summary() -> None:
     enabled_source_groups = [gid for gid, config in SOURCE_GROUPS_CONFIG.items() if config.get("enabled")]
@@ -3329,6 +3438,7 @@ async def send_startup_summary() -> None:
         f"Auto Forward: {'✅ ON' if CONFIG.get('auto_forward_enabled') else '❌ OFF'}\n"
         f"Auto Catch Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('auto_catch_sessions', []))))}</code>\n"
         f"Captcha Solver: {'✅ ON' if CONFIG.get('captcha_solver_enabled') else '❌ OFF'} | Auto: {'✅ ON' if CONFIG.get('captcha_auto_approve') else '❌ OFF'}\n"
+        f"Direct DB Catch: {'✅ ON' if CONFIG.get('direct_db_catch_enabled') else '❌ OFF'} | Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('direct_db_sessions', []))))}</code>\n"
         f"Total Source Groups: {len(SOURCE_GROUPS_CONFIG)} | Active: {len(enabled_source_groups)}\n"
         f"Total Rarities: {len(RARITY_CONFIG)} | Forward: {len(enabled_rarities)}\n"
         f"Timezone: <code>{html.escape(TZ_NAME)}</code>\n"
@@ -3387,6 +3497,8 @@ async def main() -> None:
 
     # Warm up Pyrogram peer cache so LOG_GROUP_ID works with in_memory string sessions.
     await warmup_peer_cache(app_a)
+
+    await init_direct_db()
 
     logging.warning(
         "Started successfully | session_a_id=%s | session_b_id=%s | groups=%s | auto_forward=%s",
