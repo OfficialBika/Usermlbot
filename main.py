@@ -2932,6 +2932,253 @@ def vote_ocr_results(results: list[tuple[str, float, str]], options: list[str]) 
 
 
 
+def _format_captcha_guess(answer: Optional[str], confidence: float, method: str, detail: str = "") -> str:
+    if not answer:
+        return "Best guess: <code>None</code>"
+    line = (
+        f"Best guess: <code>{html.escape(str(answer))}</code> "
+        f"(<code>{confidence * 100:.1f}%</code>)\n"
+        f"Guess method: <code>{html.escape(str(method))}</code>"
+    )
+    if detail:
+        line += f"\nGuess detail: <code>{html.escape(str(detail)[:500])}</code>"
+    return line
+
+
+def _format_candidate_ranking(candidates: list[tuple[str, float, str]], limit: int = 5) -> str:
+    cleaned = []
+    seen = set()
+    for answer, confidence, method in sorted(candidates, key=lambda x: x[1], reverse=True):
+        answer = normalize_option(answer)
+        if not answer or answer in seen:
+            continue
+        seen.add(answer)
+        cleaned.append((answer, confidence, method))
+        if len(cleaned) >= limit:
+            break
+    if not cleaned:
+        return ""
+    return " | ".join(f"{a}:{c * 100:.1f}%" for a, c, _ in cleaned)
+
+
+def _score_options_by_quadrant_templates(img, options: list[str]) -> list[tuple[str, float, str]]:
+    """
+    OCR ထက်ပိုတည်ငြိမ်အောင် button options ကို constraint အဖြစ်သုံးတဲ့ visual matcher.
+    Captcha image ကို x-axis ၄ ပိုင်းခွဲပြီး digit တစ်လုံးချင်း template similarity နဲ့ score ပေးတယ်။
+    This returns ranked guesses even when confidence is weak, so logs can show the best attempt.
+    """
+    if not captcha_cv_ready() or img is None:
+        return []
+
+    options = [normalize_option(x) for x in options if is_numeric_option(str(x))]
+    options = [x for x in options if len(x) == 4]
+    if not options:
+        return []
+
+    h_img, w_img = img.shape[:2]
+    if h_img <= 0 or w_img <= 0:
+        return []
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    masks: list[Any] = []
+    base = _digit_binary_mask_from_image(img)
+    if base is not None:
+        masks.append(base)
+
+    # Several masks: some captchas compress digits lighter/darker.
+    for gray_thr in (135, 155, 175, 195, 215):
+        mask = (gray < gray_thr).astype("uint8") * 255
+        # remove strongly colored line pixels; keep dark/gray digits.
+        colored = ((hsv[:, :, 1] > 55) & (hsv[:, :, 2] > 45)).astype("uint8") * 255
+        colored = cv2.dilate(colored, np.ones((2, 2), np.uint8), iterations=1)
+        mask[colored > 0] = 0
+        mask = cv2.medianBlur(mask, 3)
+        masks.append(mask)
+
+    for sat_max, val_max in ((80, 230), (100, 235), (130, 240), (160, 220)):
+        mask = ((hsv[:, :, 1] < sat_max) & (hsv[:, :, 2] < val_max)).astype("uint8") * 255
+        colored = ((hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 50)).astype("uint8") * 255
+        colored = cv2.dilate(colored, np.ones((2, 2), np.uint8), iterations=1)
+        mask[colored > 0] = 0
+        mask = cv2.medianBlur(mask, 3)
+        masks.append(mask)
+
+    ranked: dict[str, float] = {opt: 0.0 for opt in options}
+    best_debug = ""
+
+    for mask_idx, mask in enumerate(masks):
+        if mask is None:
+            continue
+
+        per_position_scores: list[dict[str, float]] = []
+        component_debug = []
+
+        for pos in range(4):
+            # digits are generally placed left-to-right in four broad zones
+            x1 = int(w_img * pos / 4)
+            x2 = int(w_img * (pos + 1) / 4)
+            pad_x = int(w_img * 0.035)
+            zx1 = max(0, x1 - pad_x)
+            zx2 = min(w_img, x2 + pad_x)
+            zone = mask[:, zx1:zx2]
+
+            pos_scores: dict[str, float] = {str(i): 0.0 for i in range(10)}
+            if zone.size == 0:
+                per_position_scores.append(pos_scores)
+                component_debug.append("none")
+                continue
+
+            count, labels, stats, centroids = cv2.connectedComponentsWithStats(zone, 8)
+            components = []
+            for idx in range(1, count):
+                x, y, w, h, area = stats[idx]
+                if area < 8 or area > 1800:
+                    continue
+                if w < 2 or h < 6 or w > 100 or h > 100:
+                    continue
+                aspect = float(w) / float(max(1, h))
+                if aspect > 4.0 or aspect < 0.05:
+                    continue
+                density = float(area) / float(max(1, w * h))
+                if density < 0.035 or density > 0.98:
+                    continue
+                # Ignore border fragments and far scattered dust where possible.
+                cy = float(centroids[idx][1])
+                if cy < 15 or cy > h_img - 15:
+                    continue
+                components.append((int(x), int(y), int(w), int(h), int(area), float(centroids[idx][0]), cy))
+
+            # Largest several components in this zone; digit strokes are usually among them.
+            components = sorted(components, key=lambda c: c[4], reverse=True)[:8]
+            component_debug.append(str(len(components)))
+
+            for x, y, w, h, area, cx, cy in components:
+                pad = 10
+                crop = zone[max(0, y - pad):min(zone.shape[0], y + h + pad), max(0, x - pad):min(zone.shape[1], x + w + pad)]
+                if crop.size == 0:
+                    continue
+                ys, xs = np.where(crop > 0)
+                if len(xs) > 0:
+                    crop = crop[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+                scores = _score_digit_bitmap_against_templates(crop)
+                for digit, score in scores.items():
+                    # More weight for bigger component; small dust should not dominate.
+                    weighted = float(score) * min(1.0, max(0.25, area / 80.0))
+                    if weighted > pos_scores.get(digit, 0.0):
+                        pos_scores[digit] = weighted
+
+            per_position_scores.append(pos_scores)
+
+        # Score each actual Telegram button option using the per-position visual scores.
+        option_scores: list[tuple[str, float, list[float]]] = []
+        for opt in options:
+            parts = [per_position_scores[i].get(opt[i], 0.0) for i in range(4)]
+            missing = sum(1 for p in parts if p < 0.08)
+            avg = float(sum(parts) / 4.0)
+            score = avg - (missing * 0.045)
+            option_scores.append((opt, score, parts))
+
+        option_scores.sort(key=lambda x: x[1], reverse=True)
+        if not option_scores:
+            continue
+
+        top_answer, top_score, top_parts = option_scores[0]
+        second_score = option_scores[1][1] if len(option_scores) > 1 else 0.0
+        margin = top_score - second_score
+        confidence = max(0.01, min(0.88, 0.16 + (0.62 * max(0.0, top_score)) + (0.90 * max(0.0, min(margin, 0.35)))))
+
+        # Aggregate per option across masks; max is more useful than average for noisy masks.
+        if confidence > ranked.get(top_answer, 0.0):
+            ranked[top_answer] = confidence
+            best_debug = f"mask={mask_idx}, parts={[round(x, 3) for x in top_parts]}, margin={margin:.3f}, comps={','.join(component_debug)}"
+
+    candidates = [(opt, conf, "visual_quadrant_match") for opt, conf in ranked.items() if conf > 0.01]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    # Attach debug to the top method name lightly without changing tuple shape.
+    if candidates and best_debug:
+        a, c, mth = candidates[0]
+        candidates[0] = (a, c, mth + ":" + best_debug)
+    return candidates
+
+
+def solve_by_quadrant_option_match(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+    candidates = _score_options_by_quadrant_templates(img, options)
+    if not candidates:
+        return None
+    answer, confidence, method = candidates[0]
+    # Return only if confidence is reasonable; lower guesses are only for logging.
+    if confidence < 0.34:
+        return None
+    return answer, confidence, method
+
+
+def get_captcha_best_guess(img, options: list[str]) -> Optional[tuple[str, float, str, str]]:
+    """Return best guess + confidence + method + ranked candidates, even if too weak for auto-click."""
+    if not captcha_cv_ready() or img is None:
+        return None
+
+    options = [normalize_option(x) for x in options]
+    candidates: list[tuple[str, float, str]] = []
+
+    marker = decode_plain_answer_marker(img)
+    if marker:
+        answer, conf = marker
+        if answer in options:
+            candidates.append((answer, min(0.99, max(0.85, conf)), "plain_image_marker"))
+
+    try:
+        visual = solve_by_visual_option_match(img, options)
+        if visual:
+            candidates.append(visual)
+    except Exception:
+        pass
+
+    try:
+        candidates.extend(_score_options_by_quadrant_templates(img, options)[:5])
+    except Exception as e:
+        logging.warning("quadrant best guess failed: %s", e)
+
+    for solver in [solve_by_tesseract, solve_by_easyocr]:
+        try:
+            result = solver(img, options)
+            if result:
+                candidates.append(result)
+        except Exception:
+            pass
+
+    try:
+        voted = vote_ocr_results(candidates, options)
+        if voted:
+            candidates.append(voted)
+    except Exception:
+        pass
+
+    candidates = [c for c in candidates if normalize_option(c[0]) in options]
+    if not candidates:
+        return None
+
+    by_answer: dict[str, tuple[float, set[str]]] = {}
+    for answer, conf, method in candidates:
+        answer = normalize_option(answer)
+        base_method = str(method).split(":", 1)[0]
+        old_conf, methods = by_answer.get(answer, (0.0, set()))
+        methods.add(base_method)
+        combined = max(old_conf, float(conf)) + min(0.12, 0.04 * (len(methods) - 1))
+        by_answer[answer] = (min(0.97, combined), methods)
+
+    ranked = sorted(
+        [(ans, conf, "+".join(sorted(methods))) for ans, (conf, methods) in by_answer.items()],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    best_answer, best_conf, best_method = ranked[0]
+    detail = _format_candidate_ranking(ranked, limit=5)
+    return best_answer, best_conf, best_method, detail
+
+
+
 def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, float, str]]:
     options = [normalize_option(x) for x in options]
 
@@ -2950,6 +3197,15 @@ def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, flo
         visual_result = None
     if visual_result:
         return visual_result
+
+    # 2b) OCR-free option-constrained quadrant/template matcher.
+    try:
+        quadrant_result = solve_by_quadrant_option_match(img, options)
+    except Exception as e:
+        logging.warning("visual_quadrant_match failed: %s", e)
+        quadrant_result = None
+    if quadrant_result:
+        return quadrant_result
 
     # 3) OCR engines as fallback.
     results: list[tuple[str, float, str]] = []
@@ -3049,7 +3305,7 @@ async def add_pending_captcha(
         f"Request ID: <code>{req_id}</code>\n"
         f"Session: <code>{html.escape(session_key)}</code>\n"
         f"Detected: <code>{html.escape(normalize_option(answer))}</code>\n"
-        f"Confidence: <code>{confidence:.2f}</code>\n"
+        f"Confidence: <code>{confidence * 100:.1f}%</code>\n"
         f"Method: <code>{html.escape(method)}</code>\n"
         f"Options: <code>{html.escape(' | '.join(options))}</code>\n\n"
         "Approve: <code>/approve</code> or <code>/approve_id REQUEST_ID</code>\n"
@@ -3222,11 +3478,18 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
 
     result = solve_captcha_image_auto(img, options)
     if not result:
+        best_guess = get_captcha_best_guess(img, options)
         if CONFIG.get("captcha_log_no_answer", True):
+            guess_text = "Best guess: <code>None</code>"
+            if best_guess:
+                guess_answer, guess_conf, guess_method, guess_detail = best_guess
+                guess_text = _format_captcha_guess(guess_answer, guess_conf, guess_method, guess_detail)
             await send_log(
-                "🧩 <b>Captcha detected but no answer found.</b>\n"
+                "🧩 <b>Captcha detected but no confident answer found.</b>\n"
                 f"Session: <code>{html.escape(session_key)}</code>\n"
-                f"Options: <code>{html.escape(' | '.join(options))}</code>",
+                f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+                f"{guess_text}\n"
+                "Action: <code>not clicked</code>",
                 parse_html=True,
                 app=app,
             )
@@ -3235,12 +3498,19 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     answer, confidence, method = result
     min_conf = CONFIG.get("captcha_min_confidence", 0.60)
     if confidence < min_conf:
+        best_guess = get_captcha_best_guess(img, options)
+        guess_text = ""
+        if best_guess:
+            guess_answer, guess_conf, guess_method, guess_detail = best_guess
+            guess_text = "\n" + _format_captcha_guess(guess_answer, guess_conf, guess_method, guess_detail)
         await send_log(
             "🧩 <b>Captcha answer found but confidence too low.</b>\n"
-            f"Answer: <code>{html.escape(answer)}</code>\n"
-            f"Confidence: <code>{confidence:.2f}</code> / required <code>{min_conf:.2f}</code>\n"
+            f"Answer: <code>{html.escape(answer)}</code> (<code>{confidence * 100:.1f}%</code>)\n"
+            f"Required: <code>{min_conf * 100:.1f}%</code>\n"
             f"Method: <code>{html.escape(method)}</code>\n"
-            f"Options: <code>{html.escape(' | '.join(options))}</code>",
+            f"Options: <code>{html.escape(' | '.join(options))}</code>"
+            f"{guess_text}\n"
+            "Action: <code>not clicked</code>",
             parse_html=True,
             app=app,
         )
@@ -3261,7 +3531,7 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
                 "✅ <b>Captcha auto-clicked.</b>\n"
                 f"Session: <code>{html.escape(session_key)}</code>\n"
                 f"Answer: <code>{html.escape(answer)}</code>\n"
-                f"Confidence: <code>{confidence:.2f}</code>\n"
+                f"Confidence: <code>{confidence * 100:.1f}%</code>\n"
                 f"Method: <code>{html.escape(method)}</code>\n"
                 f"Options: <code>{html.escape(' | '.join(options))}</code>",
                 parse_html=True,
