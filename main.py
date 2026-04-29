@@ -62,7 +62,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@HODAKAMORISHI"
+DEFAULT_OWNER_TAG = "@Bikasec"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
@@ -135,6 +135,8 @@ pending_captchas: dict[int, dict[str, Any]] = {}
 captcha_message_to_request: dict[Tuple[str, int, int], int] = {}
 captcha_lock = asyncio.Lock()
 processed_captcha_messages: set[Tuple[str, int, int]] = set()
+captcha_recent_items: dict[Tuple[str, int, int], dict[str, Any]] = {}
+_LEARNED_DIGIT_TEMPLATE_CACHE: Optional[dict[str, list[Any]]] = None
 easyocr_reader = None
 
 # Direct MongoDB catch system
@@ -342,7 +344,7 @@ def load_config() -> dict:
         "captcha_auto_approve": getenv_bool("CAPTCHA_AUTO_APPROVE", False),
         "captcha_auto_approve_methods": {
             x.strip()
-            for x in os.getenv("CAPTCHA_AUTO_APPROVE_METHODS", "plain_image_marker,visual_option_match,tesseract_ocr,easyocr_ocr,ocr_vote").split(",")
+            for x in os.getenv("CAPTCHA_AUTO_APPROVE_METHODS", "plain_image_marker,learned_template_match,tesseract_ocr,easyocr_ocr,ocr_vote").split(",")
             if x.strip()
         },
         "captcha_min_confidence": getenv_float("MIN_SOLVER_CONFIDENCE", getenv_float("CAPTCHA_MIN_CONFIDENCE", 0.60)),
@@ -353,6 +355,10 @@ def load_config() -> dict:
         "enable_easyocr": getenv_bool("ENABLE_EASYOCR", False),
         "captcha_log_no_answer": getenv_bool("CAPTCHA_LOG_NO_ANSWER", True),
         "captcha_debug_save": getenv_bool("CAPTCHA_DEBUG_SAVE", False),
+        "captcha_allow_coordinate_click": getenv_bool("CAPTCHA_ALLOW_COORDINATE_CLICK", False),
+        "captcha_learning_enabled": getenv_bool("CAPTCHA_LEARNING_ENABLED", True),
+        "captcha_learning_min_templates": getenv_int("CAPTCHA_LEARNING_MIN_TEMPLATES", 3),
+        "captcha_learn_template_limit_per_digit": getenv_int("CAPTCHA_LEARN_TEMPLATE_LIMIT_PER_DIGIT", 200),
 
         # Direct MongoDB catch lookup. This bypasses responder bot reply parsing.
         "direct_db_catch_enabled": direct_db_catch_enabled,
@@ -500,6 +506,21 @@ def init_database() -> None:
             rarity TEXT,
             reason TEXT,
             group_id INTEGER
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS captcha_digit_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            digit TEXT NOT NULL,
+            template BLOB NOT NULL,
+            width INTEGER NOT NULL DEFAULT 32,
+            height INTEGER NOT NULL DEFAULT 32,
+            answer TEXT,
+            source_session TEXT,
+            source_chat_id INTEGER,
+            source_message_id INTEGER
         )
     """)
 
@@ -2236,18 +2257,102 @@ async def download_pyro_message_media_as_cv2(app: Client, m):
 
 
 async def click_button_by_text_pyro(m, answer: str) -> bool:
+    """
+    Click the inline keyboard button whose visible text equals answer.
+
+    Important: do NOT use row/column coordinates by default. In Pyrogram versions,
+    coordinate order can be easy to mix up, which may click a different button even
+    when the detected answer is correct. This function prefers exact text/callback
+    clicking and only uses coordinate fallback when explicitly enabled.
+    """
     answer = normalize_option(answer)
     rows = getattr(getattr(m, "reply_markup", None), "inline_keyboard", None)
     if not rows:
+        logging.warning("captcha click skipped: no inline keyboard")
         return False
+
+    matched_button = None
+    matched_row = -1
+    matched_col = -1
+
     for row_index, row in enumerate(rows):
         for col_index, btn in enumerate(row):
-            text = normalize_option(getattr(btn, "text", "") or "")
-            if text == answer:
-                await m.click(row_index, col_index)
-                return True
-    return False
+            btn_text = normalize_option(getattr(btn, "text", "") or "")
+            if btn_text == answer:
+                matched_button = btn
+                matched_row = row_index
+                matched_col = col_index
+                break
+        if matched_button is not None:
+            break
 
+    if matched_button is None:
+        logging.warning("captcha click skipped: answer button not found | answer=%s", answer)
+        return False
+
+    # 1) Safest: send exact callback_data for the matched button.
+    callback_data = getattr(matched_button, "callback_data", None)
+    if callback_data:
+        try:
+            await m._client.request_callback_answer(
+                chat_id=m.chat.id,
+                message_id=m.id,
+                callback_data=callback_data,
+                timeout=10,
+            )
+            logging.warning(
+                "captcha clicked by callback_data | answer=%s | row=%s col=%s",
+                answer, matched_row, matched_col,
+            )
+            return True
+        except Exception as e:
+            logging.warning(
+                "captcha callback_data click failed, trying text click | answer=%s | row=%s col=%s | error=%s",
+                answer, matched_row, matched_col, e,
+            )
+
+    # 2) Safe fallback: let Pyrogram find button by exact text.
+    # Different Pyrogram builds expose either positional text or keyword text.
+    for attempt_name, call in (
+        ("text_positional", lambda: m.click(answer)),
+        ("text_keyword", lambda: m.click(text=answer)),
+    ):
+        try:
+            result = call()
+            if hasattr(result, "__await__"):
+                await result
+            logging.warning(
+                "captcha clicked by %s | answer=%s | row=%s col=%s",
+                attempt_name, answer, matched_row, matched_col,
+            )
+            return True
+        except TypeError:
+            continue
+        except Exception as e:
+            logging.warning(
+                "captcha %s click failed | answer=%s | row=%s col=%s | error=%s",
+                attempt_name, answer, matched_row, matched_col, e,
+            )
+
+    # 3) Unsafe coordinate fallback is disabled by default. Enable only if your
+    # Pyrogram build cannot click by callback/text.
+    if CONFIG.get("captcha_allow_coordinate_click", False):
+        try:
+            # Pyrogram coordinate order is x=column, y=row.
+            await m.click(matched_col, matched_row)
+            logging.warning(
+                "captcha clicked by coordinate fallback | answer=%s | row=%s col=%s",
+                answer, matched_row, matched_col,
+            )
+            return True
+        except Exception as e:
+            logging.warning(
+                "captcha coordinate click failed | answer=%s | row=%s col=%s | error=%s",
+                answer, matched_row, matched_col, e,
+            )
+
+    logging.warning("captcha click failed safely: no click method worked | answer=%s", answer)
+    return False
 
 # Plain image marker decoder: works only if your own captcha generator embeds it.
 MARKER_MAGIC_BITS = [1, 0, 1, 1]
@@ -2720,6 +2825,218 @@ def _read_digits_by_single_char_tesseract(img, group) -> list[str]:
     return out
 
 
+
+def _template_to_blob(template) -> bytes:
+    if not captcha_cv_ready() or template is None:
+        return b""
+    tpl = _resize_digit_bitmap_to_square(template, 32)
+    if tpl is None:
+        return b""
+    return tpl.astype("uint8").tobytes()
+
+
+def _blob_to_template(blob: bytes):
+    if not captcha_cv_ready() or not blob:
+        return None
+    try:
+        arr = np.frombuffer(blob, dtype=np.uint8)
+        if arr.size != 32 * 32:
+            return None
+        return arr.reshape((32, 32)).copy()
+    except Exception:
+        return None
+
+
+def _similarity_to_template_set(binary, templates: list[Any]) -> float:
+    if not captcha_cv_ready() or binary is None or not templates:
+        return 0.0
+    roi = _resize_digit_bitmap_to_square(binary, 32)
+    if roi is None:
+        return 0.0
+    roi_f = roi.astype("float32") / 255.0
+    roi_b = roi_f > 0.20
+    roi_norm = float(np.sqrt(np.sum(roi_f * roi_f)))
+    best = 0.0
+    for template in templates:
+        if template is None:
+            continue
+        tpl_f = template.astype("float32") / 255.0
+        tpl_b = tpl_f > 0.20
+        union = np.sum(roi_b | tpl_b)
+        iou = float(np.sum(roi_b & tpl_b) / union) if union > 0 else 0.0
+        tpl_norm = float(np.sqrt(np.sum(tpl_f * tpl_f)))
+        corr = 0.0 if roi_norm <= 1e-6 or tpl_norm <= 1e-6 else float(np.sum(roi_f * tpl_f) / (roi_norm * tpl_norm + 1e-6))
+        score = (0.60 * iou) + (0.40 * corr)
+        if score > best:
+            best = score
+    return best
+
+
+async def _count_captcha_templates() -> tuple[int, dict[str, int]]:
+    rows = await db_fetchall("SELECT digit, COUNT(*) FROM captcha_digit_templates GROUP BY digit")
+    counts = {str(d): int(c) for d, c in rows}
+    return sum(counts.values()), counts
+
+
+def _load_learned_digit_templates_sync() -> dict[str, list[Any]]:
+    global _LEARNED_DIGIT_TEMPLATE_CACHE
+    if _LEARNED_DIGIT_TEMPLATE_CACHE is not None:
+        return _LEARNED_DIGIT_TEMPLATE_CACHE
+    cache: dict[str, list[Any]] = {str(i): [] for i in range(10)}
+    if db_conn is None or not captcha_cv_ready():
+        _LEARNED_DIGIT_TEMPLATE_CACHE = cache
+        return cache
+    try:
+        cur = db_conn.cursor()
+        cur.execute("SELECT digit, template FROM captcha_digit_templates ORDER BY id DESC LIMIT 3000")
+        for digit, blob in cur.fetchall():
+            digit = str(digit)
+            if digit not in cache:
+                continue
+            tpl = _blob_to_template(blob)
+            if tpl is not None:
+                cache[digit].append(tpl)
+    except Exception as e:
+        logging.warning("load learned captcha templates failed: %s", e)
+    _LEARNED_DIGIT_TEMPLATE_CACHE = cache
+    return cache
+
+
+def _extract_four_digit_crops_for_learning(img) -> Optional[list[Any]]:
+    if not captcha_cv_ready() or img is None:
+        return None
+    masks = []
+    main_mask = _digit_binary_mask_from_image(img)
+    if main_mask is not None:
+        masks.append(main_mask)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    for gray_thr in (145, 165, 185, 205):
+        mask = (gray < gray_thr).astype("uint8") * 255
+        colored = ((hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 45)).astype("uint8") * 255
+        colored = cv2.dilate(colored, np.ones((2, 2), np.uint8), iterations=1)
+        mask[colored > 0] = 0
+        mask = cv2.medianBlur(mask, 3)
+        masks.append(mask)
+    best_group = None
+    best_mask = None
+    best_score = -1e18
+    for mask in masks:
+        comps = _extract_digit_candidates_relaxed(mask)
+        group = _choose_four_digit_candidates(comps)
+        if not group:
+            continue
+        areas = [c[4] for c in group]
+        ys = [c[6] for c in group]
+        xs = [c[5] for c in group]
+        score = sum(areas) - 1.4 * (max(ys) - min(ys)) + 0.02 * (max(xs) - min(xs))
+        if score > best_score:
+            best_score = score
+            best_group = group
+            best_mask = mask
+    if not best_group or best_mask is None:
+        return None
+    crops = []
+    for x, y, w, h, area, cx, cy in sorted(best_group, key=lambda c: c[5]):
+        pad = 10
+        crop = best_mask[max(0, y - pad):min(best_mask.shape[0], y + h + pad), max(0, x - pad):min(best_mask.shape[1], x + w + pad)]
+        if crop.size == 0:
+            return None
+        ys, xs = np.where(crop > 0)
+        if len(xs) > 0:
+            crop = crop[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        tpl = _resize_digit_bitmap_to_square(crop, 32)
+        if tpl is None:
+            return None
+        crops.append(tpl)
+    return crops if len(crops) == 4 else None
+
+
+async def save_learned_captcha_templates_from_image(img, answer: str, session_key: str, chat_id: int, message_id: int) -> bool:
+    global _LEARNED_DIGIT_TEMPLATE_CACHE
+    if not CONFIG.get("captcha_learning_enabled", True):
+        return False
+    answer = normalize_option(answer)
+    if not re.fullmatch(r"\d{4}", answer):
+        return False
+    crops = _extract_four_digit_crops_for_learning(img)
+    if not crops or len(crops) != 4:
+        await send_log(
+            "⚠️ <b>Captcha learning failed.</b>\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            "Reason: <code>could not segment 4 digits</code>",
+            parse_html=True,
+        )
+        return False
+    limit = int(CONFIG.get("captcha_learn_template_limit_per_digit", 200))
+    async with db_lock:
+        if db_conn is None:
+            return False
+        cur = db_conn.cursor()
+        for digit, crop in zip(answer, crops):
+            blob = _template_to_blob(crop)
+            if not blob:
+                continue
+            cur.execute(
+                """
+                INSERT INTO captcha_digit_templates
+                (created_at, digit, template, width, height, answer, source_session, source_chat_id, source_message_id)
+                VALUES (?, ?, ?, 32, 32, ?, ?, ?, ?)
+                """,
+                (now_local_str(), digit, blob, answer, session_key, int(chat_id), int(message_id)),
+            )
+            cur.execute(
+                """
+                DELETE FROM captcha_digit_templates
+                WHERE digit = ? AND id NOT IN (
+                    SELECT id FROM captcha_digit_templates
+                    WHERE digit = ? ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (digit, digit, limit),
+            )
+        db_conn.commit()
+    _LEARNED_DIGIT_TEMPLATE_CACHE = None
+    return True
+
+
+def solve_by_learned_template_match(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+    if not captcha_cv_ready() or img is None:
+        return None
+    options = [normalize_option(x) for x in options if is_numeric_option(str(x))]
+    options = [x for x in options if len(x) == 4]
+    if not options:
+        return None
+    cache = _load_learned_digit_templates_sync()
+    min_templates = int(CONFIG.get("captcha_learning_min_templates", 3))
+    required_digits = set("".join(options))
+    missing = [d for d in sorted(required_digits) if len(cache.get(d, [])) < min_templates]
+    if missing:
+        return None
+    crops = _extract_four_digit_crops_for_learning(img)
+    if not crops or len(crops) != 4:
+        return None
+    per_position_scores = []
+    for crop in crops:
+        pos_scores = {str(i): _similarity_to_template_set(crop, cache.get(str(i), [])) for i in range(10)}
+        per_position_scores.append(pos_scores)
+    option_scores: list[tuple[str, float, list[float]]] = []
+    for option in options:
+        parts = [per_position_scores[i].get(option[i], 0.0) for i in range(4)]
+        weak_penalty = sum(1 for p in parts if p < 0.28) * 0.06
+        score = float(sum(parts) / 4.0) - weak_penalty
+        option_scores.append((option, score, parts))
+    option_scores.sort(key=lambda x: x[1], reverse=True)
+    if not option_scores:
+        return None
+    top_answer, top_score, top_parts = option_scores[0]
+    second_score = option_scores[1][1] if len(option_scores) > 1 else 0.0
+    margin = top_score - second_score
+    if top_score < 0.36 or margin < 0.04:
+        return None
+    confidence = min(0.98, 0.52 + 0.38 * max(0.0, top_score) + 0.90 * min(0.30, max(0.0, margin)))
+    return top_answer, confidence, f"learned_template_match:parts={[round(x,3) for x in top_parts]},margin={margin:.3f}"
+
 def solve_by_visual_option_match(img, options: list[str]) -> Optional[tuple[str, float, str]]:
     """
     Strong captcha solver using the button options as constraints.
@@ -3129,6 +3446,13 @@ def get_captcha_best_guess(img, options: list[str]) -> Optional[tuple[str, float
             candidates.append((answer, min(0.99, max(0.85, conf)), "plain_image_marker"))
 
     try:
+        learned = solve_by_learned_template_match(img, options)
+        if learned:
+            candidates.append(learned)
+    except Exception:
+        pass
+
+    try:
         visual = solve_by_visual_option_match(img, options)
         if visual:
             candidates.append(visual)
@@ -3189,7 +3513,17 @@ def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, flo
         if answer in options:
             return answer, min(0.99, max(0.85, conf)), "plain_image_marker"
 
-    # 2) Best for this exact captcha design: match the visible digit components against button options.
+    # 2) Learned local template matcher. This becomes the most accurate method after
+    # you correct/train several captchas with /captcha_answer 1234.
+    try:
+        learned_result = solve_by_learned_template_match(img, options)
+    except Exception as e:
+        logging.warning("learned_template_match failed: %s", e)
+        learned_result = None
+    if learned_result:
+        return learned_result
+
+    # 3) Visual matchers are useful for guess/logging, but safe-mode can block auto-click.
     try:
         visual_result = solve_by_visual_option_match(img, options)
     except Exception as e:
@@ -3270,6 +3604,7 @@ async def add_pending_captcha(
     answer: str,
     confidence: float,
     method: str,
+    image_path: str = "",
 ) -> int:
     chat_id = int(m.chat.id)
     message_id = int(m.id)
@@ -3289,6 +3624,7 @@ async def add_pending_captcha(
             "detected_answer": normalize_option(answer),
             "confidence": float(confidence),
             "method": method,
+            "image_path": image_path,
             "created_at": time.time(),
         }
 
@@ -3359,6 +3695,18 @@ async def approve_captcha_request(m, request_id: Optional[int] = None) -> None:
         )
         return
 
+    learned = False
+    image_path = item.get("image_path") or ""
+    if image_path and os.path.exists(image_path) and captcha_cv_ready():
+        img = cv2.imread(image_path)
+        learned = await save_learned_captcha_templates_from_image(
+            img,
+            str(item.get("detected_answer")),
+            str(item.get("session_key")),
+            int(item.get("chat_id")),
+            int(item.get("message_id")),
+        )
+
     async with captcha_lock:
         pending_captchas.pop(int(item["request_id"]), None)
         captcha_message_to_request.pop(
@@ -3368,6 +3716,7 @@ async def approve_captcha_request(m, request_id: Optional[int] = None) -> None:
 
     await m.reply(
         "✅ Captcha approved and clicked.\n"
+        f"Learned: <code>{learned}</code>\n"
         f"Request ID: <code>{item['request_id']}</code>\n"
         f"Answer: <code>{html.escape(str(item.get('detected_answer')))}</code>\n"
         f"Method: <code>{html.escape(str(item.get('method')))}</code>",
@@ -3433,6 +3782,118 @@ async def send_captcha_pending(m) -> None:
     await m.reply("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+
+def _captcha_debug_image_path(session_key: str, chat_id: int, message_id: int) -> str:
+    safe_chat = str(chat_id).replace("-", "m")
+    return os.path.join(DATA_DIR, f"captcha_{session_key}_{safe_chat}_{message_id}.jpg")
+
+
+async def remember_recent_captcha(session_key: str, m, options: list[str], img) -> Optional[str]:
+    if not captcha_cv_ready() or img is None:
+        return None
+    chat_id = int(m.chat.id)
+    message_id = int(m.id)
+    image_path = _captcha_debug_image_path(session_key, chat_id, message_id)
+    try:
+        cv2.imwrite(image_path, img)
+    except Exception:
+        image_path = ""
+    key = (session_key, chat_id, message_id)
+    async with captcha_lock:
+        captcha_recent_items[key] = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "options": list(options),
+            "image_path": image_path,
+            "created_at": time.time(),
+        }
+        if len(captcha_recent_items) > 100:
+            oldest = sorted(captcha_recent_items.items(), key=lambda kv: kv[1].get("created_at", 0))[:-100]
+            for old_key, _ in oldest:
+                captcha_recent_items.pop(old_key, None)
+    return image_path
+
+
+async def get_latest_recent_captcha(session_key: Optional[str] = None) -> Optional[dict[str, Any]]:
+    async with captcha_lock:
+        items = [dict(v) for v in captcha_recent_items.values()]
+    now = time.time()
+    items = [x for x in items if now - float(x.get("created_at", now)) <= 300]
+    if session_key:
+        items = [x for x in items if x.get("session_key") == session_key]
+    if not items:
+        return None
+    items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    return items[0]
+
+
+async def handle_captcha_manual_answer(m, answer: str) -> None:
+    answer = normalize_option(answer)
+    if not re.fullmatch(r"\d{4}", answer):
+        await m.reply("❌ Usage: <code>/captcha_answer 1234</code>", parse_mode=ParseMode.HTML)
+        return
+    item = await get_latest_recent_captcha()
+    if not item:
+        await m.reply("❌ No recent captcha image found. Try again right after captcha appears.")
+        return
+    if answer not in [normalize_option(x) for x in item.get("options", [])]:
+        await m.reply(
+            "❌ Answer is not in current button options.\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            f"Options: <code>{html.escape(' | '.join(item.get('options', [])))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    app = app_a if item.get("session_key") == "a" else app_b
+    if app is None:
+        await m.reply("❌ Client session not available.")
+        return
+    clicked = False
+    try:
+        msg = await app.get_messages(int(item["chat_id"]), int(item["message_id"]))
+        clicked = await click_button_by_text_pyro(msg, answer)
+    except Exception as e:
+        logging.warning("manual captcha answer click failed: %s", e)
+    learned = False
+    image_path = item.get("image_path") or ""
+    if image_path and os.path.exists(image_path) and captcha_cv_ready():
+        img = cv2.imread(image_path)
+        learned = await save_learned_captcha_templates_from_image(
+            img,
+            answer,
+            str(item.get("session_key")),
+            int(item.get("chat_id")),
+            int(item.get("message_id")),
+        )
+    total, counts = await _count_captcha_templates()
+    await m.reply(
+        f"{'✅' if clicked else '⚠️'} Captcha answer handled.\n"
+        f"Clicked: <code>{clicked}</code>\n"
+        f"Learned: <code>{learned}</code>\n"
+        f"Answer: <code>{html.escape(answer)}</code>\n"
+        f"Templates: <code>{total}</code>\n"
+        f"Counts: <code>{html.escape(', '.join(f'{k}:{v}' for k, v in sorted(counts.items())) or 'none')}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def send_captcha_learn_status(m) -> None:
+    total, counts = await _count_captcha_templates()
+    min_templates = int(CONFIG.get("captcha_learning_min_templates", 3))
+    lines = [
+        "🧠 <b>Captcha Learning Status</b>",
+        f"Enabled: {'✅ ON' if CONFIG.get('captcha_learning_enabled', True) else '❌ OFF'}",
+        f"Total templates: <code>{total}</code>",
+        f"Min templates per digit: <code>{min_templates}</code>",
+        "Counts:",
+    ]
+    for d in map(str, range(10)):
+        v = counts.get(d, 0)
+        lines.append(f"• <code>{d}</code>: <code>{v}</code> {'✅' if v >= min_templates else '⚠️'}")
+    lines.append("\nManual train/click: <code>/captcha_answer 1234</code>")
+    await m.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+
 async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     if not CONFIG.get("captcha_solver_enabled"):
         return
@@ -3469,12 +3930,7 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
         await send_log("🧩 Captcha image download/decode failed.", parse_html=True, app=app)
         return
 
-    if CONFIG.get("captcha_debug_save"):
-        try:
-            debug_path = os.path.join(DATA_DIR, f"captcha_{session_key}_{m.chat.id}_{m.id}.jpg")
-            cv2.imwrite(debug_path, img)
-        except Exception:
-            pass
+    image_path = await remember_recent_captcha(session_key, m, options, img)
 
     result = solve_captcha_image_auto(img, options)
     if not result:
@@ -3524,6 +3980,33 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
         method in auto_methods or method_base in auto_methods
     )
 
+    # Safety guard: visual-only methods can be wrong when colored lines cross digits.
+    # They are useful for best-guess logging, but should not auto-click unless explicitly allowed.
+    risky_visual_methods = {
+        x.strip()
+        for x in os.getenv(
+            "CAPTCHA_RISKY_AUTO_BLOCK_METHODS",
+            "visual_option_match,visual_quadrant_match",
+        ).split(",")
+        if x.strip()
+    }
+    allow_risky_visual_auto = getenv_bool("CAPTCHA_ALLOW_RISKY_VISUAL_AUTO", False)
+
+    if method_base in risky_visual_methods and not allow_risky_visual_auto:
+        if can_auto:
+            await send_log(
+                "🛡️ <b>Captcha auto-click blocked by safe mode.</b>\n"
+                f"Session: <code>{html.escape(session_key)}</code>\n"
+                f"Detected: <code>{html.escape(answer)}</code> (<code>{confidence * 100:.1f}%</code>)\n"
+                f"Method: <code>{html.escape(method)}</code>\n"
+                f"Reason: <code>visual-only methods are not trusted for auto-click</code>\n"
+                f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+                "Action: <code>approval needed</code>",
+                parse_html=True,
+                app=app,
+            )
+        can_auto = False
+
     if can_auto:
         clicked = await click_button_by_text_pyro(m, answer)
         if clicked:
@@ -3541,7 +4024,7 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
 
         await send_log("❌ Captcha auto-click failed; fallback to approval.", parse_html=True, app=app)
 
-    await add_pending_captcha(app, session_key, m, options, answer, confidence, method)
+    await add_pending_captcha(app, session_key, m, options, answer, confidence, method, image_path or "")
 
 
 def is_owner_message(m) -> bool:
@@ -3634,6 +4117,8 @@ async def send_help(m) -> None:
         "• <code>/captcha_auto_off</code> - approval mode ပြန်သုံး\n"
         "• <code>/captcha_auto_status</code> - captcha solver status\n"
         "• <code>/captcha_pending</code> or <code>/pending</code> - pending captcha list\n"
+        "• <code>/captcha_answer 1234</code> - correct answer click + learn\n"
+        "• <code>/captcha_learn_status</code> - learned template count\n"
         "• <code>/approve</code> or <code>/approve_id ID</code> - approve and click\n"
         "• <code>/reject</code> or <code>/reject ID</code> - reject captcha\n\n"
         "<b>History / Test:</b>\n"
@@ -3875,6 +4360,8 @@ async def handle_owner_command(_, m) -> None:
                 f"Tesseract: {'✅' if CONFIG.get('enable_tesseract_ocr') else '❌'} | "
                 f"EasyOCR: {'✅' if CONFIG.get('enable_easyocr') else '❌'}\n"
                 f"OpenCV ready: {'✅' if captcha_cv_ready() else '❌'}\n"
+                f"Learning: {'✅ ON' if CONFIG.get('captcha_learning_enabled', True) else '❌ OFF'}\n"
+                f"Templates: <code>{(await _count_captcha_templates())[0]}</code>\n"
                 f"Pending: <code>{pending_count}</code>",
                 parse_mode=ParseMode.HTML,
             )
@@ -3882,6 +4369,18 @@ async def handle_owner_command(_, m) -> None:
 
         if cmd in {"/captcha_pending", "/pending"}:
             await send_captcha_pending(m)
+            return
+
+        if cmd in {"/captcha_answer", "/captcha_correct", "/answer"}:
+            parts = text.split()
+            if len(parts) < 2:
+                await m.reply("❌ Usage: <code>/captcha_answer 1234</code>", parse_mode=ParseMode.HTML)
+                return
+            await handle_captcha_manual_answer(m, parts[1])
+            return
+
+        if cmd in {"/captcha_learn_status", "/captcha_learning_status"}:
+            await send_captcha_learn_status(m)
             return
 
         if cmd == "/approve":
