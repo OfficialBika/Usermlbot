@@ -62,7 +62,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@HODAKAMORISHI"
+DEFAULT_OWNER_TAG = "@Bikasec"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
@@ -3560,6 +3560,126 @@ def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, flo
     return None
 
 
+def _captcha_method_parts(method: str) -> set[str]:
+    """Split combined solver method names such as 'ocr_vote+visual_quadrant_match:debug'."""
+    raw = str(method or "").strip()
+    if not raw:
+        return set()
+    no_debug = raw.split(":", 1)[0]
+    parts = {x.strip() for x in re.split(r"[+,]", no_debug) if x.strip()}
+    parts.add(no_debug)
+    parts.add(raw)
+    return parts
+
+
+def _captcha_method_allowed(method: str, allowed_methods: set[str]) -> bool:
+    if not allowed_methods:
+        return False
+    allowed = {str(x).strip() for x in allowed_methods if str(x).strip()}
+    parts = _captcha_method_parts(method)
+    return bool(parts & allowed)
+
+
+def _captcha_method_is_risky(method: str) -> bool:
+    parts = _captcha_method_parts(method)
+
+    # Combined methods such as "ocr_vote+visual_quadrant_match" are not
+    # visual-only risky because OCR/learned/plain-marker has confirmed them.
+    trusted_parts = {
+        "plain_image_marker",
+        "learned_template_match",
+        "ocr_vote",
+        "tesseract_ocr",
+        "easyocr_ocr",
+    }
+    if parts & trusted_parts:
+        return False
+
+    risky_methods = {
+        x.strip()
+        for x in os.getenv(
+            "CAPTCHA_RISKY_AUTO_BLOCK_METHODS",
+            "visual_option_match,visual_quadrant_match",
+        ).split(",")
+        if x.strip()
+    }
+    if not risky_methods:
+        return False
+    return bool(parts & risky_methods)
+
+
+async def _try_auto_click_captcha_guess(
+    app: Client,
+    session_key: str,
+    m,
+    answer: str,
+    confidence: float,
+    method: str,
+    options: list[str],
+    label: str = "best_guess",
+) -> bool:
+    """Auto-click a captcha guess if env rules allow it."""
+    auto_enabled = CONFIG.get("captcha_auto_approve", False)
+    if not auto_enabled:
+        return False
+
+    auto_methods = CONFIG.get("captcha_auto_approve_methods", set())
+    if not _captcha_method_allowed(method, auto_methods):
+        await send_log(
+            "🧩 <b>Captcha best guess not clicked.</b>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Answer: <code>{html.escape(answer)}</code> (<code>{confidence * 100:.1f}%</code>)\n"
+            f"Method: <code>{html.escape(method)}</code>\n"
+            f"Reason: <code>method not allowed by CAPTCHA_AUTO_APPROVE_METHODS</code>\n"
+            f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+            "Action: <code>not clicked</code>",
+            parse_html=True,
+            app=app,
+        )
+        return False
+
+    allow_risky_visual_auto = getenv_bool("CAPTCHA_ALLOW_RISKY_VISUAL_AUTO", False)
+    if _captcha_method_is_risky(method) and not allow_risky_visual_auto:
+        await send_log(
+            "🛡️ <b>Captcha auto-click blocked by safe mode.</b>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Detected: <code>{html.escape(answer)}</code> (<code>{confidence * 100:.1f}%</code>)\n"
+            f"Method: <code>{html.escape(method)}</code>\n"
+            f"Reason: <code>visual/risky method blocked. Set CAPTCHA_ALLOW_RISKY_VISUAL_AUTO=true to allow.</code>\n"
+            f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+            "Action: <code>approval needed</code>",
+            parse_html=True,
+            app=app,
+        )
+        return False
+
+    clicked = await click_button_by_text_pyro(m, answer)
+    if clicked:
+        await send_log(
+            "✅ <b>Captcha auto-clicked.</b>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            f"Confidence: <code>{confidence * 100:.1f}%</code>\n"
+            f"Method: <code>{html.escape(method)}</code>\n"
+            f"Source: <code>{html.escape(label)}</code>\n"
+            f"Options: <code>{html.escape(' | '.join(options))}</code>",
+            parse_html=True,
+            app=app,
+        )
+        return True
+
+    await send_log(
+        "❌ <b>Captcha auto-click failed.</b>\n"
+        f"Session: <code>{html.escape(session_key)}</code>\n"
+        f"Answer: <code>{html.escape(answer)}</code>\n"
+        f"Method: <code>{html.escape(method)}</code>\n"
+        f"Options: <code>{html.escape(' | '.join(options))}</code>",
+        parse_html=True,
+        app=app,
+    )
+    return False
+
+
 async def captcha_cleanup_expired() -> None:
     timeout = CONFIG.get("captcha_approval_timeout", 120)
     now = time.time()
@@ -3828,7 +3948,98 @@ async def get_latest_recent_captcha(session_key: Optional[str] = None) -> Option
     return items[0]
 
 
-async def handle_captcha_manual_answer(m, answer: str) -> None:
+async def handle_captcha_photo_caption_learning(app: Client, m, answer: str) -> bool:
+    """
+    Manual learning from an owner-sent photo with caption like:
+        /captcha_answer 1351
+
+    This is TRAIN-ONLY because the uploaded photo is not the original captcha
+    message with buttons. It improves learned_template_match for future captchas.
+    """
+    answer = normalize_option(answer)
+    if not re.fullmatch(r"\d{4}", answer):
+        await m.reply("❌ Usage: <code>/captcha_answer 1234</code>", parse_mode=ParseMode.HTML)
+        return True
+
+    if not getattr(m, "photo", None):
+        return False
+
+    if not captcha_cv_ready():
+        await m.reply(
+            "❌ OpenCV/Numpy မရှိသေးပါ။ requirements ထဲမှာ opencv-python-headless + numpy install လိုပါတယ်။"
+        )
+        return True
+
+    img = await download_pyro_message_media_as_cv2(app, m)
+    if img is None:
+        await m.reply("❌ Photo ကို download/decode မလုပ်နိုင်ပါ။")
+        return True
+
+    learned = await save_learned_captcha_templates_from_image(
+        img,
+        answer,
+        "manual_photo",
+        int(m.chat.id) if m.chat else 0,
+        int(m.id),
+    )
+
+    total, counts = await _count_captcha_templates()
+    if learned:
+        await m.reply(
+            "✅ Captcha photo learned successfully.\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            f"Templates: <code>{total}</code>\n"
+            f"Counts: <code>{html.escape(', '.join(f'{k}:{v}' for k, v in sorted(counts.items())) or 'none')}</code>\n\n"
+            "မှတ်ချက်: Photo+caption learning က train-only ပါ။ လက်ရှိ captcha button ကိုနှိပ်တာမလုပ်ပါဘူး။",
+            parse_mode=ParseMode.HTML,
+        )
+        await send_log(
+            "🧠 <b>Captcha manual photo learned</b>\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            f"Templates: <code>{total}</code>\n"
+            f"Source: <code>owner_photo_caption</code>",
+            parse_html=True,
+            app=app,
+        )
+    else:
+        await m.reply(
+            "⚠️ Captcha photo learning failed.\n"
+            f"Answer: <code>{html.escape(answer)}</code>\n"
+            "Reason: 4 digits ကို image ထဲကနေ ခွဲမထုတ်နိုင်သေးပါ။\n\n"
+            "အကောင်းဆုံးရလဒ်အတွက် captcha number ပုံကို crop လုပ်ပြီး ပို့ပါ။ Telegram UI/screenshot တစ်ခုလုံးမပို့ပါနဲ့။",
+            parse_mode=ParseMode.HTML,
+        )
+
+    return True
+
+
+async def handle_captcha_manual_answer(app_or_message, m_or_answer=None, answer_value: Optional[str] = None) -> None:
+    """
+    Supports both call styles:
+      old: handle_captcha_manual_answer(m, answer)
+      new: handle_captcha_manual_answer(app, m, answer)
+
+    If owner sends photo + caption /captcha_answer 1234, learn from that photo.
+    Otherwise, use latest recent captcha: click answer + learn from saved original captcha image.
+    """
+    if answer_value is None:
+        app = app_a or app_b
+        m = app_or_message
+        answer = str(m_or_answer or "")
+    else:
+        app = app_or_message
+        m = m_or_answer
+        answer = str(answer_value or "")
+
+    if app is None:
+        await m.reply("❌ Client session not available.")
+        return
+
+    # New path: owner sends captcha photo with caption /captcha_answer 1234
+    handled_photo = await handle_captcha_photo_caption_learning(app, m, answer)
+    if handled_photo:
+        return
+
     answer = normalize_option(answer)
     if not re.fullmatch(r"\d{4}", answer):
         await m.reply("❌ Usage: <code>/captcha_answer 1234</code>", parse_mode=ParseMode.HTML)
@@ -3891,7 +4102,8 @@ async def send_captcha_learn_status(m) -> None:
     for d in map(str, range(10)):
         v = counts.get(d, 0)
         lines.append(f"• <code>{d}</code>: <code>{v}</code> {'✅' if v >= min_templates else '⚠️'}")
-    lines.append("\nManual train/click: <code>/captcha_answer 1234</code>")
+    lines.append("\nManual train/click latest: <code>/captcha_answer 1234</code>")
+    lines.append("Photo train only: send captcha photo with caption <code>/captcha_answer 1234</code>")
     await m.reply("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
@@ -3933,22 +4145,69 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     image_path = await remember_recent_captcha(session_key, m, options, img)
 
     result = solve_captcha_image_auto(img, options)
+
+    # Weak visual-only direct results are moved into the best-guess consensus flow.
+    # This avoids clicking low-confidence visual guesses while still allowing fast
+    # auto-click when OCR vote / learned template confirms the answer.
+    if result:
+        _ans0, _conf0, _method0 = result
+        visual_direct_min = getenv_float("CAPTCHA_VISUAL_DIRECT_MIN_CONFIDENCE", 0.70)
+        if _captcha_method_is_risky(str(_method0)) and float(_conf0) < visual_direct_min:
+            logging.warning(
+                "weak visual direct result moved to best-guess flow | answer=%s conf=%.3f method=%s",
+                _ans0, float(_conf0), _method0,
+            )
+            result = None
+
     if not result:
         best_guess = get_captcha_best_guess(img, options)
-        if CONFIG.get("captcha_log_no_answer", True):
-            guess_text = "Best guess: <code>None</code>"
-            if best_guess:
-                guess_answer, guess_conf, guess_method, guess_detail = best_guess
-                guess_text = _format_captcha_guess(guess_answer, guess_conf, guess_method, guess_detail)
-            await send_log(
-                "🧩 <b>Captcha detected but no confident answer found.</b>\n"
-                f"Session: <code>{html.escape(session_key)}</code>\n"
-                f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
-                f"{guess_text}\n"
-                "Action: <code>not clicked</code>",
-                parse_html=True,
-                app=app,
+        if best_guess:
+            guess_answer, guess_conf, guess_method, guess_detail = best_guess
+
+            # Allow best-guess auto click when confidence and method rules pass.
+            best_guess_auto = getenv_bool("CAPTCHA_AUTO_CLICK_BEST_GUESS", True)
+            best_guess_min = getenv_float(
+                "CAPTCHA_BEST_GUESS_MIN_CONFIDENCE",
+                CONFIG.get("captcha_auto_min_confidence", 0.75),
             )
+            if best_guess_auto and guess_conf >= best_guess_min:
+                clicked = await _try_auto_click_captcha_guess(
+                    app,
+                    session_key,
+                    m,
+                    normalize_option(guess_answer),
+                    float(guess_conf),
+                    str(guess_method),
+                    options,
+                    label="best_guess",
+                )
+                if clicked:
+                    return
+
+            if CONFIG.get("captcha_log_no_answer", True):
+                guess_text = _format_captcha_guess(guess_answer, guess_conf, guess_method, guess_detail)
+                await send_log(
+                    "🧩 <b>Captcha detected but no confident answer found.</b>\n"
+                    f"Session: <code>{html.escape(session_key)}</code>\n"
+                    f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+                    f"{guess_text}\n"
+                    f"Best guess auto: <code>{'ON' if best_guess_auto else 'OFF'}</code>\n"
+                    f"Best guess min: <code>{best_guess_min * 100:.1f}%</code>\n"
+                    "Action: <code>not clicked</code>",
+                    parse_html=True,
+                    app=app,
+                )
+        else:
+            if CONFIG.get("captcha_log_no_answer", True):
+                await send_log(
+                    "🧩 <b>Captcha detected but no confident answer found.</b>\n"
+                    f"Session: <code>{html.escape(session_key)}</code>\n"
+                    f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+                    "Best guess: <code>None</code>\n"
+                    "Action: <code>not clicked</code>",
+                    parse_html=True,
+                    app=app,
+                )
         return
 
     answer, confidence, method = result
@@ -3976,9 +4235,7 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     auto_enabled = CONFIG.get("captcha_auto_approve", False)
     auto_min = CONFIG.get("captcha_auto_min_confidence", 0.75)
     method_base = method.split(":", 1)[0]
-    can_auto = auto_enabled and confidence >= auto_min and (
-        method in auto_methods or method_base in auto_methods
-    )
+    can_auto = auto_enabled and confidence >= auto_min and _captcha_method_allowed(method, auto_methods)
 
     # Safety guard: visual-only methods can be wrong when colored lines cross digits.
     # They are useful for best-guess logging, but should not auto-click unless explicitly allowed.
@@ -3992,7 +4249,7 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     }
     allow_risky_visual_auto = getenv_bool("CAPTCHA_ALLOW_RISKY_VISUAL_AUTO", False)
 
-    if method_base in risky_visual_methods and not allow_risky_visual_auto:
+    if _captcha_method_is_risky(method) and not allow_risky_visual_auto:
         if can_auto:
             await send_log(
                 "🛡️ <b>Captcha auto-click blocked by safe mode.</b>\n"
@@ -4117,7 +4374,8 @@ async def send_help(m) -> None:
         "• <code>/captcha_auto_off</code> - approval mode ပြန်သုံး\n"
         "• <code>/captcha_auto_status</code> - captcha solver status\n"
         "• <code>/captcha_pending</code> or <code>/pending</code> - pending captcha list\n"
-        "• <code>/captcha_answer 1234</code> - correct answer click + learn\n"
+        "• <code>/captcha_answer 1234</code> - latest captcha click + learn\n"
+        "• photo + caption <code>/captcha_answer 1234</code> - train from photo only\n"
         "• <code>/captcha_learn_status</code> - learned template count\n"
         "• <code>/approve</code> or <code>/approve_id ID</code> - approve and click\n"
         "• <code>/reject</code> or <code>/reject ID</code> - reject captcha\n\n"
@@ -4283,7 +4541,7 @@ async def handle_owner_command(_, m) -> None:
         if not is_command_context(m):
             return
 
-        text = (m.text or "").strip()
+        text = (m.text or m.caption or "").strip()
         text_lower = text.lower()
         cmd = parse_command(text)
         chat_id = m.chat.id
@@ -4371,12 +4629,12 @@ async def handle_owner_command(_, m) -> None:
             await send_captcha_pending(m)
             return
 
-        if cmd in {"/captcha_answer", "/captcha_correct", "/answer"}:
+        if cmd in {"/captcha_answer", "/captcha_correct", "/answer", "/captcha_train"}:
             parts = text.split()
             if len(parts) < 2:
                 await m.reply("❌ Usage: <code>/captcha_answer 1234</code>", parse_mode=ParseMode.HTML)
                 return
-            await handle_captcha_manual_answer(m, parts[1])
+            await handle_captcha_manual_answer(_, m, parts[1])
             return
 
         if cmd in {"/captcha_learn_status", "/captcha_learning_status"}:
@@ -4606,11 +4864,35 @@ async def handle_owner_command(_, m) -> None:
         logging.warning("owner command handler failed: %s", e)
 
 
+async def warmup_captcha_engines() -> None:
+    """Preload captcha template/OCR engines in background for the first captcha."""
+    if not CONFIG.get("captcha_solver_enabled"):
+        return
+    try:
+        if captcha_cv_ready():
+            await asyncio.to_thread(_get_digit_template_cache)
+            await asyncio.to_thread(_load_learned_digit_templates_sync)
+        if CONFIG.get("enable_easyocr", False):
+            await asyncio.to_thread(_get_easyocr_reader)
+        if getenv_bool("CAPTCHA_WARMUP_LOG", False):
+            await send_log(
+                "🔥 <b>Captcha engines warmed up.</b>\n"
+                f"OpenCV: {'✅' if captcha_cv_ready() else '❌'} | "
+                f"Tesseract: {'✅' if CONFIG.get('enable_tesseract_ocr') else '❌'} | "
+                f"EasyOCR: {'✅' if CONFIG.get('enable_easyocr') else '❌'}",
+                parse_html=True,
+                app=app_a,
+            )
+    except Exception as e:
+        logging.warning("captcha engine warmup failed: %s", e)
+
+
 async def handle_general_message(app: Client, session_key: str, m) -> None:
     try:
+        # Captcha has only 60 seconds. Solve/click first, then do logs/mentions.
+        await handle_captcha_solver(app, session_key, m)
         await handle_spawn_alert(app, m, session_key)
         await handle_responder_dm(app, session_key, m)
-        await handle_captcha_solver(app, session_key, m)
         await handle_auto_forward_spawn(app, session_key, m)
         await handle_fail_new_message(app, session_key, m)
     except Exception as e:
@@ -4638,7 +4920,8 @@ def register_handlers() -> None:
     async def responder_dm_b(_, m):
         await handle_responder_dm(app_b, "b", m)
 
-    @app_a.on_message(filters.text & owner_filter, group=0)
+    # Owner commands can be text OR photo+caption, e.g. /captcha_answer 1351.
+    @app_a.on_message(owner_filter, group=0)
     async def commands_a(_, m):
         await handle_owner_command(_, m)
 
@@ -4779,6 +5062,7 @@ async def main() -> None:
     await send_startup_summary()
 
     captcha_cleanup_task = asyncio.create_task(captcha_cleanup_loop())
+    captcha_warmup_task = asyncio.create_task(warmup_captcha_engines())
 
     try:
         await idle()
@@ -4786,6 +5070,8 @@ async def main() -> None:
         stop_active_timer()
         if 'captcha_cleanup_task' in locals() and captcha_cleanup_task and not captcha_cleanup_task.done():
             captcha_cleanup_task.cancel()
+        if 'captcha_warmup_task' in locals() and captcha_warmup_task and not captcha_warmup_task.done():
+            captcha_warmup_task.cancel()
         await shutdown_clients()
 
 
