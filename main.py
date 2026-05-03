@@ -62,7 +62,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@HODAKAMORISHI"
+DEFAULT_OWNER_TAG = "@Bikasec"
 
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
@@ -138,6 +138,20 @@ processed_captcha_messages: set[Tuple[str, int, int]] = set()
 captcha_recent_items: dict[Tuple[str, int, int], dict[str, Any]] = {}
 _LEARNED_DIGIT_TEMPLATE_CACHE: Optional[dict[str, list[Any]]] = None
 easyocr_reader = None
+
+# Captcha OCR / visual solving can be CPU-heavy. Run it outside the main
+# Pyrogram update handler so card auto-catch messages are not delayed while
+# captcha is being solved. Keep concurrency low to avoid CPU starvation.
+CAPTCHA_SOLVER_CONCURRENCY = max(1, int(os.getenv("CAPTCHA_SOLVER_CONCURRENCY", "1")))
+captcha_solver_semaphore = asyncio.Semaphore(CAPTCHA_SOLVER_CONCURRENCY)
+
+
+async def run_cpu_solver(func, *args, timeout: Optional[float] = None):
+    async with captcha_solver_semaphore:
+        coro = asyncio.to_thread(func, *args)
+        if timeout and timeout > 0:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        return await coro
 
 # Direct MongoDB catch system
 direct_mongo_client = None
@@ -4144,7 +4158,23 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
 
     image_path = await remember_recent_captcha(session_key, m, options, img)
 
-    result = solve_captcha_image_auto(img, options)
+    solver_timeout = getenv_float("CAPTCHA_SOLVER_TIMEOUT_SECONDS", 18.0)
+    try:
+        result = await run_cpu_solver(solve_captcha_image_auto, img, options, timeout=solver_timeout)
+    except asyncio.TimeoutError:
+        await send_log(
+            "🧩 <b>Captcha solver timeout.</b>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Timeout: <code>{solver_timeout:.1f}s</code>\n"
+            f"Options: <code>{html.escape(' | '.join(options))}</code>\n"
+            "Action: <code>not clicked</code>",
+            parse_html=True,
+            app=app,
+        )
+        return
+    except Exception as e:
+        logging.warning("captcha CPU solver failed: %s", e)
+        result = None
 
     # Weak visual-only direct results are moved into the best-guess consensus flow.
     # This avoids clicking low-confidence visual guesses while still allowing fast
@@ -4160,7 +4190,13 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
             result = None
 
     if not result:
-        best_guess = get_captcha_best_guess(img, options)
+        try:
+            best_guess = await run_cpu_solver(get_captcha_best_guess, img, options, timeout=getenv_float("CAPTCHA_BEST_GUESS_TIMEOUT_SECONDS", 8.0))
+        except asyncio.TimeoutError:
+            best_guess = None
+        except Exception as e:
+            logging.warning("captcha best guess failed: %s", e)
+            best_guess = None
         if best_guess:
             guess_answer, guess_conf, guess_method, guess_detail = best_guess
 
@@ -4213,7 +4249,13 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     answer, confidence, method = result
     min_conf = CONFIG.get("captcha_min_confidence", 0.60)
     if confidence < min_conf:
-        best_guess = get_captcha_best_guess(img, options)
+        try:
+            best_guess = await run_cpu_solver(get_captcha_best_guess, img, options, timeout=getenv_float("CAPTCHA_BEST_GUESS_TIMEOUT_SECONDS", 8.0))
+        except asyncio.TimeoutError:
+            best_guess = None
+        except Exception as e:
+            logging.warning("captcha low-conf best guess failed: %s", e)
+            best_guess = None
         guess_text = ""
         if best_guess:
             guess_answer, guess_conf, guess_method, guess_detail = best_guess
@@ -4620,7 +4662,10 @@ async def handle_owner_command(_, m) -> None:
                 f"OpenCV ready: {'✅' if captcha_cv_ready() else '❌'}\n"
                 f"Learning: {'✅ ON' if CONFIG.get('captcha_learning_enabled', True) else '❌ OFF'}\n"
                 f"Templates: <code>{(await _count_captcha_templates())[0]}</code>\n"
-                f"Pending: <code>{pending_count}</code>",
+                f"Pending: <code>{pending_count}</code>\n"
+                f"Background solve: <code>ON</code>\n"
+                f"Solver concurrency: <code>{CAPTCHA_SOLVER_CONCURRENCY}</code>\n"
+                f"Solver timeout: <code>{getenv_float('CAPTCHA_SOLVER_TIMEOUT_SECONDS', 18.0):.1f}s</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -4889,12 +4934,24 @@ async def warmup_captcha_engines() -> None:
 
 async def handle_general_message(app: Client, session_key: str, m) -> None:
     try:
-        # Captcha has only 60 seconds. Solve/click first, then do logs/mentions.
-        await handle_captcha_solver(app, session_key, m)
-        await handle_spawn_alert(app, m, session_key)
+        # IMPORTANT: do not await captcha OCR here. OCR/EasyOCR/visual matching can
+        # take several seconds and would delay later card-spawn updates in the same
+        # Pyrogram worker. Direct DB auto-catch must stay fast, so we schedule
+        # captcha solving in the background and continue immediately.
+        if CONFIG.get("captcha_solver_enabled") and session_key in CONFIG.get("captcha_solver_sessions", {"a"}):
+            try:
+                if looks_like_captcha_message(m):
+                    asyncio.create_task(handle_captcha_solver(app, session_key, m))
+            except Exception as e:
+                logging.warning("captcha background schedule failed: %s", e)
+
+        # Fast paths first: responder reply and direct DB catch.
         await handle_responder_dm(app, session_key, m)
         await handle_auto_forward_spawn(app, session_key, m)
         await handle_fail_new_message(app, session_key, m)
+
+        # Low-priority notification path last so it never delays auto-catch.
+        await handle_spawn_alert(app, m, session_key)
     except Exception as e:
         logging.warning("handle_general_message_%s failed: %s", session_key, e)
 
