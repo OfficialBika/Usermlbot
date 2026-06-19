@@ -156,6 +156,12 @@ async def run_cpu_solver(func, *args, timeout: Optional[float] = None):
 # Direct MongoDB catch system
 direct_mongo_client = None
 direct_items_collection = None
+direct_support_bots_collection = None
+
+# Lookup-bot support bot cache.
+# Key = Telegram bot id, value = support bot profile loaded from MongoDB.
+direct_supported_bots_by_id: dict[int, dict[str, Any]] = {}
+direct_supported_bots_by_key: dict[str, dict[str, Any]] = {}
 
 def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
@@ -311,8 +317,10 @@ def load_config() -> dict:
         responder_bot_ids = {responder_bot_id}
 
     if auto_forward_enabled:
-        if bot_id is None:
-            raise RuntimeError("BOT_ID is required when AUTO_FORWARD_ENABLED=true")
+        # Direct DB support-bot mode can read every source bot from MongoDB,
+        # so BOT_ID is optional when DIRECT_DB_CATCH_ENABLED=true.
+        if bot_id is None and not direct_db_catch_enabled:
+            raise RuntimeError("BOT_ID is required when AUTO_FORWARD_ENABLED=true and DIRECT_DB_CATCH_ENABLED=false")
         if not direct_db_catch_enabled and responder_bot_id is None and not responder_bot_ids:
             raise RuntimeError("RESPONDER_BOT_ID or RESPONDER_BOT_IDS is required when AUTO_FORWARD_ENABLED=true, unless DIRECT_DB_CATCH_ENABLED=true")
 
@@ -382,12 +390,23 @@ def load_config() -> dict:
         "direct_db_sessions": parse_session_keys(os.getenv("DIRECT_DB_CATCH_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a,b")), "a"),
         "direct_db_command_name": os.getenv("DIRECT_DB_COMMAND_NAME", "/catch").strip() or "/catch",
         "direct_db_source_bot_key": os.getenv("DIRECT_DB_SOURCE_BOT_KEY", "catcher").strip() or "catcher",
+
+        # Lookup bot support-bot mode.
+        # The support-bot collection tells this userbot which Telegram bot id uses
+        # which command/source key, so one codebase can catch from many bots.
+        "direct_db_use_support_bots": getenv_bool("DIRECT_DB_USE_SUPPORT_BOTS", True),
+        "direct_db_support_bots_collection": os.getenv("DIRECT_DB_SUPPORT_BOTS_COLLECTION", os.getenv("SUPPORT_BOTS_COLLECTION", "support_bots")).strip() or "support_bots",
+        "direct_db_support_bots_limit": getenv_int("DIRECT_DB_SUPPORT_BOTS_LIMIT", 1000),
+        "direct_db_accept_unknown_source_bots": getenv_bool("DIRECT_DB_ACCEPT_UNKNOWN_SOURCE_BOTS", False),
+        "direct_db_cmd_name_only": getenv_bool("DIRECT_DB_CMD_NAME_ONLY", True),
+        "direct_db_source_match_mode": os.getenv("DIRECT_DB_SOURCE_MATCH_MODE", "strict").strip().lower() or "strict",
+
         "direct_db_use_file_unique_id": getenv_bool("DIRECT_DB_USE_FILE_UNIQUE_ID", True),
         "direct_db_use_sha256": getenv_bool("DIRECT_DB_USE_SHA256", True),
         "direct_db_use_phash": getenv_bool("DIRECT_DB_USE_PHASH", False),
         "direct_db_phash_threshold": getenv_int("DIRECT_DB_PHASH_THRESHOLD", 8),
         "direct_db_phash_scan_limit": getenv_int("DIRECT_DB_PHASH_SCAN_LIMIT", 5000),
-        "direct_db_name_mode": os.getenv("DIRECT_DB_CATCH_NAME_MODE", "hint").strip().lower() or "hint",
+        "direct_db_name_mode": os.getenv("DIRECT_DB_CATCH_NAME_MODE", "full").strip().lower() or "full",
         "direct_db_command_field": os.getenv("DIRECT_DB_CATCH_COMMAND_FIELD", "command").strip() or "command",
         "direct_db_hint_field": os.getenv("DIRECT_DB_CATCH_HINT_FIELD", "hint").strip() or "hint",
         "direct_db_name_field": os.getenv("DIRECT_DB_CATCH_NAME_FIELD", "name").strip() or "name",
@@ -952,10 +971,32 @@ def extract_label_value(text: str, labels: list[str]) -> str:
 
 def is_character_spawn_text(message_text: str) -> bool:
     normalized = normalize_text(message_text)
+
+    supported_command_words = {"catch"}
+    try:
+        for profile in list(direct_supported_bots_by_id.values()) + list(direct_supported_bots_by_key.values()):
+            command = normalize_command_name(profile.get("command_name"), CONFIG.get("direct_db_command_name", "/catch"))
+            supported_command_words.add(command.lstrip("/").lower())
+    except Exception:
+        pass
+
+    configured_command = str(CONFIG.get("direct_db_command_name", "/catch") or "/catch").strip().lstrip("/").lower()
+    if configured_command:
+        supported_command_words.add(configured_command)
+
+    has_supported_command = any(
+        re.search(rf"\b{re.escape(cmd)}\b", normalized)
+        for cmd in supported_command_words
+        if cmd
+    )
+
     return (
         "a character has spawned" in normalized
+        or "character has spawned" in normalized
         or "add this character" in normalized
-        or "/catch" in normalized
+        or "new character" in normalized
+        or "guess the character" in normalized
+        or has_supported_command
     )
 
 
@@ -1387,7 +1428,158 @@ async def handle_attention_log(app: Client, m, session_key: str) -> bool:
 # DIRECT MONGODB CATCH LOOKUP
 # =========================
 
-def direct_db_base_filter() -> dict[str, Any]:
+def first_non_empty(data: dict[str, Any], keys: list[str], default: Any = None) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return default
+
+
+def normalize_command_name(value: Any, default: str = "/catch") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raw = default
+    raw = strip_invisible(raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    first = raw.split()[0] if raw else default
+    if not first.startswith("/"):
+        first = "/" + first.lstrip("/")
+    return first
+
+
+def normalize_support_bot_doc(doc: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalize a lookup-bot support-bot document into a local profile.
+
+    This accepts several common schemas so the bot can work with older/newer
+    lookup DBs without editing code:
+      bot_id / user_id / telegram_id / id
+      source_bot_key / bot_key / key
+      command_name / cmd / command / catch_command_name
+    """
+    if not isinstance(doc, dict):
+        return None
+
+    enabled_value = first_non_empty(doc, ["enabled", "is_enabled", "active", "status"], True)
+    if isinstance(enabled_value, str) and enabled_value.strip().lower() in {"false", "0", "off", "disabled", "inactive", "no"}:
+        return None
+    if enabled_value is False:
+        return None
+
+    bot_id_value = first_non_empty(
+        doc,
+        [
+            "bot_id",
+            "source_bot_id",
+            "telegram_bot_id",
+            "telegram_id",
+            "user_id",
+            "id",
+        ],
+    )
+    bot_id: Optional[int] = None
+    if bot_id_value is not None:
+        try:
+            bot_id = int(str(bot_id_value).strip())
+        except Exception:
+            bot_id = None
+
+    source_bot_key = str(
+        first_non_empty(
+            doc,
+            ["source_bot_key", "bot_key", "key", "slug", "bot_slug", "name_key"],
+            "",
+        ) or ""
+    ).strip()
+
+    username = str(first_non_empty(doc, ["username", "bot_username", "source_bot_username"], "") or "").strip()
+    display_name = str(first_non_empty(doc, ["display_name", "title", "bot_name", "name"], source_bot_key or username or str(bot_id or "")) or "").strip()
+
+    raw_command = first_non_empty(
+        doc,
+        ["command_name", "catch_command_name", "cmd", "catch_cmd", "command", "bot_command"],
+        CONFIG.get("direct_db_command_name", "/catch"),
+    )
+    command_name = normalize_command_name(raw_command, CONFIG.get("direct_db_command_name", "/catch"))
+
+    if bot_id is None and not source_bot_key:
+        return None
+
+    return {
+        "bot_id": bot_id,
+        "source_bot_key": source_bot_key,
+        "username": username,
+        "display_name": display_name,
+        "command_name": command_name,
+        "command_field": str(first_non_empty(doc, ["command_field"], CONFIG.get("direct_db_command_field", "command")) or "command").strip(),
+        "hint_field": str(first_non_empty(doc, ["hint_field"], CONFIG.get("direct_db_hint_field", "hint")) or "hint").strip(),
+        "name_field": str(first_non_empty(doc, ["name_field"], CONFIG.get("direct_db_name_field", "name")) or "name").strip(),
+        "raw": doc,
+    }
+
+
+def get_direct_source_profile(m) -> Optional[dict[str, Any]]:
+    """Return the support-bot profile for this incoming message sender."""
+    for sender_id in get_message_sender_candidates(m):
+        profile = direct_supported_bots_by_id.get(int(sender_id))
+        if profile:
+            return profile
+
+    # Backward compatible single-source fallback.
+    bot_id = CONFIG.get("bot_id")
+    if bot_id and int(bot_id) in get_message_sender_candidates(m):
+        source_key = CONFIG.get("direct_db_source_bot_key", "catcher")
+        return {
+            "bot_id": int(bot_id),
+            "source_bot_key": source_key,
+            "username": "",
+            "display_name": source_key,
+            "command_name": normalize_command_name(CONFIG.get("direct_db_command_name", "/catch")),
+            "command_field": CONFIG.get("direct_db_command_field", "command"),
+            "hint_field": CONFIG.get("direct_db_hint_field", "hint"),
+            "name_field": CONFIG.get("direct_db_name_field", "name"),
+            "raw": {},
+        }
+
+    return None
+
+
+def direct_db_base_filter(source_profile: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Build a source-specific item filter.
+
+    Old code matched one hard-coded catcher bot. This version first tries to
+    restrict matches to the support bot that actually sent the current spawn,
+    so Hallow/Catch/Yelan/etc. can each use its own command + name.
+    """
+    if source_profile:
+        source_key = str(source_profile.get("source_bot_key") or "").strip()
+        command_name = normalize_command_name(source_profile.get("command_name"), CONFIG.get("direct_db_command_name", "/catch"))
+        bot_id = source_profile.get("bot_id")
+
+        id_clauses = []
+        if bot_id is not None:
+            for field in ("source_bot_id", "bot_id", "telegram_bot_id", "user_id"):
+                id_clauses.append({field: int(bot_id)})
+
+        match_mode = str(CONFIG.get("direct_db_source_match_mode", "strict") or "strict").lower()
+        if source_key:
+            if match_mode in {"loose", "or", "fallback"}:
+                clauses = [{"source_bot_key": source_key}] + id_clauses
+                if command_name:
+                    clauses.append({"command_name": command_name})
+                return {"$or": clauses}
+            return {"source_bot_key": source_key}
+
+        if id_clauses:
+            return {"$or": id_clauses}
+
+        if command_name:
+            return {"command_name": command_name}
+
+    # Backward-compatible default for old one-bot setups.
     return {
         "$or": [
             {"command_name": CONFIG.get("direct_db_command_name", "/catch")},
@@ -1459,6 +1651,77 @@ def hamming_hex_hash(a: str, b: str) -> int:
         return 999
 
 
+async def load_direct_support_bots() -> None:
+    """Load lookup bot's support bot mapping from MongoDB.
+
+    The collection is read-only. If it is empty or missing, the old BOT_ID /
+    DIRECT_DB_SOURCE_BOT_KEY setup still works.
+    """
+    global direct_support_bots_collection, direct_supported_bots_by_id, direct_supported_bots_by_key
+
+    direct_supported_bots_by_id = {}
+    direct_supported_bots_by_key = {}
+
+    if not CONFIG.get("direct_db_use_support_bots", True):
+        return
+    if direct_mongo_client is None:
+        return
+
+    db_name = CONFIG.get("direct_db_name", "")
+    collection_name = CONFIG.get("direct_db_support_bots_collection", "support_bots")
+    limit = int(CONFIG.get("direct_db_support_bots_limit", 1000))
+
+    if not db_name or not collection_name:
+        return
+
+    try:
+        direct_support_bots_collection = direct_mongo_client[db_name][collection_name]
+        cursor = direct_support_bots_collection.find({}).limit(limit)
+
+        async for doc in cursor:
+            profile = normalize_support_bot_doc(doc)
+            if not profile:
+                continue
+
+            bot_id = profile.get("bot_id")
+            source_key = str(profile.get("source_bot_key") or "").strip()
+
+            if bot_id is not None:
+                direct_supported_bots_by_id[int(bot_id)] = profile
+            if source_key:
+                direct_supported_bots_by_key[source_key] = profile
+
+        if direct_supported_bots_by_id or direct_supported_bots_by_key:
+            examples = []
+            for profile in list(direct_supported_bots_by_id.values())[:12]:
+                examples.append(
+                    f"{profile.get('display_name') or profile.get('source_bot_key') or profile.get('bot_id')}"
+                    f" → <code>{html.escape(str(profile.get('command_name')))}</code>"
+                )
+            await send_log(
+                "✅ <b>Support bots loaded from Lookup DB</b>\n"
+                f"Collection: <code>{html.escape(collection_name)}</code>\n"
+                f"By bot ID: <code>{len(direct_supported_bots_by_id)}</code>\n"
+                f"By source key: <code>{len(direct_supported_bots_by_key)}</code>\n"
+                + ("\n" + "\n".join(f"• {x}" for x in examples) if examples else ""),
+                parse_html=True,
+            )
+        else:
+            await send_log(
+                "⚠️ <b>No support bots loaded.</b>\n"
+                f"Collection checked: <code>{html.escape(collection_name)}</code>\n"
+                "Fallback: <code>BOT_ID + DIRECT_DB_SOURCE_BOT_KEY</code>",
+                parse_html=True,
+            )
+    except Exception as e:
+        logging.warning("load_direct_support_bots failed: %s", e)
+        await send_log(
+            f"⚠️ Support bot load failed: <code>{html.escape(str(e))}</code>\n"
+            "Fallback: <code>BOT_ID + DIRECT_DB_SOURCE_BOT_KEY</code>",
+            parse_html=True,
+        )
+
+
 async def init_direct_db() -> None:
     global direct_mongo_client, direct_items_collection
 
@@ -1488,11 +1751,16 @@ async def init_direct_db() -> None:
         # MongoDB is intentionally READ-ONLY here.
         # Do NOT create indexes or write any document/metadata from this userbot.
         # Use MongoDB Atlas/index management manually outside this bot if indexes are needed.
+        await load_direct_support_bots()
+
         await send_log(
             "✅ <b>Direct DB catch connected</b>\n"
             f"DB: <code>{html.escape(db_name)}</code>\n"
-            f"Collection: <code>{html.escape(collection_name)}</code>\n"
-            f"Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('direct_db_sessions', []))))}</code>",
+            f"Items collection: <code>{html.escape(collection_name)}</code>\n"
+            f"Support bots collection: <code>{html.escape(str(CONFIG.get('direct_db_support_bots_collection', 'support_bots')))}</code>\n"
+            f"Support bots loaded: <code>{len(direct_supported_bots_by_id)}</code>\n"
+            f"Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('direct_db_sessions', []))))}</code>\n"
+            f"Command mode: <code>{'cmd+name only' if CONFIG.get('direct_db_cmd_name_only', True) else 'stored command allowed'}</code>",
             parse_html=True,
         )
     except Exception as e:
@@ -1501,11 +1769,11 @@ async def init_direct_db() -> None:
         await send_log(f"❌ Direct DB catch connect failed: <code>{html.escape(str(e))}</code>", parse_html=True)
 
 
-async def direct_db_find_item(app: Client, m) -> tuple[Optional[dict[str, Any]], str]:
+async def direct_db_find_item(app: Client, m, source_profile: Optional[dict[str, Any]] = None) -> tuple[Optional[dict[str, Any]], str]:
     if direct_items_collection is None:
         return None, "db_not_ready"
 
-    base_filter = direct_db_base_filter()
+    base_filter = direct_db_base_filter(source_profile)
     projection = {
         "name": 1,
         "hint": 1,
@@ -1513,6 +1781,10 @@ async def direct_db_find_item(app: Client, m) -> tuple[Optional[dict[str, Any]],
         "catch_command": 1,
         "command_name": 1,
         "source_bot_key": 1,
+        "source_bot_id": 1,
+        "bot_id": 1,
+        "telegram_bot_id": 1,
+        "user_id": 1,
         "media_type": 1,
         "file_unique_id": 1,
         "sha256": 1,
@@ -1580,53 +1852,117 @@ def strip_name_decorations(value: str) -> str:
     return " ".join(value.split()).strip()
 
 
-def build_direct_catch_command(doc: dict[str, Any]) -> Optional[str]:
-    command_field = CONFIG.get("direct_db_command_field", "command")
-    hint_field = CONFIG.get("direct_db_hint_field", "hint")
-    name_field = CONFIG.get("direct_db_name_field", "name")
-    command_name = str(doc.get("command_name") or CONFIG.get("direct_db_command_name", "/catch") or "/catch").strip()
-    if not command_name.startswith("/"):
-        command_name = "/catch"
+def pick_direct_name_value(doc: dict[str, Any], source_profile: Optional[dict[str, Any]] = None) -> str:
+    name_field = (source_profile or {}).get("name_field") or CONFIG.get("direct_db_name_field", "name")
+    hint_field = (source_profile or {}).get("hint_field") or CONFIG.get("direct_db_hint_field", "hint")
 
-    # 1) If DB already stores exact command, use it.
+    # cmd+name mode should use the real stored name first, not the old full
+    # command string. Fallback fields cover common lookup-bot schemas.
+    for key in [name_field, "name", "character_name", "char_name", "title", "full_name"]:
+        value = doc.get(key)
+        if isinstance(value, str) and value.strip():
+            cleaned = strip_name_decorations(value)
+            if cleaned:
+                return cleaned
+
+    for key in [hint_field, "hint", "short_name", "query"]:
+        value = doc.get(key)
+        if isinstance(value, str) and value.strip():
+            cleaned = strip_name_decorations(value)
+            if cleaned:
+                return cleaned
+
+    return ""
+
+
+def build_direct_catch_command(doc: dict[str, Any], source_profile: Optional[dict[str, Any]] = None) -> Optional[str]:
+    command_field = (source_profile or {}).get("command_field") or CONFIG.get("direct_db_command_field", "command")
+    command_name = normalize_command_name(
+        (source_profile or {}).get("command_name")
+        or doc.get("command_name")
+        or CONFIG.get("direct_db_command_name", "/catch"),
+        CONFIG.get("direct_db_command_name", "/catch"),
+    )
+
+    # New default: always send exactly “cmd + name” for the support bot that
+    # posted the spawn. This prevents one bot's stored /catch command from being
+    # reused for another bot. Set DIRECT_DB_CMD_NAME_ONLY=false to restore the
+    # old exact-command behavior.
+    if CONFIG.get("direct_db_cmd_name_only", True):
+        name = pick_direct_name_value(doc, source_profile)
+        if not name:
+            return None
+
+        mode = CONFIG.get("direct_db_name_mode", "full")
+        if mode not in {"full", "name", "full_name"}:
+            name = name.split()[0]
+
+        return f"{command_name} {name}".strip()
+
+    # Backward-compatible old behavior: If DB already stores exact command, use it.
     for key in [command_field, "catch_command", "command"]:
         value = doc.get(key)
         if isinstance(value, str) and value.strip().lower().startswith(command_name.lower()):
             return clean_catch_command(value.strip()) or value.strip()
 
-    # 2) Prefer stored hint if available.
-    hint = str(doc.get(hint_field) or "").strip()
-    if hint:
-        hint = strip_name_decorations(hint)
-        if hint:
-            return f"{command_name} {hint}".strip()
-
-    # 3) Build from name. Default mode = first token/hint, because most catcher bots accept short hint.
-    name = strip_name_decorations(str(doc.get(name_field) or ""))
+    name = pick_direct_name_value(doc, source_profile)
     if not name:
         return None
 
-    mode = CONFIG.get("direct_db_name_mode", "hint")
-    if mode in {"full", "name", "full_name"}:
-        value = name
-    else:
-        value = name.split()[0]
+    mode = CONFIG.get("direct_db_name_mode", "full")
+    if mode not in {"full", "name", "full_name"}:
+        name = name.split()[0]
 
-    return f"{command_name} {value}".strip()
+    return f"{command_name} {name}".strip()
 
 
-async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optional[str], group_name: str) -> bool:
+async def handle_direct_db_catch(
+    app: Client,
+    session_key: str,
+    m,
+    rarity: Optional[str],
+    group_name: str,
+    source_profile: Optional[dict[str, Any]] = None,
+) -> bool:
     if not CONFIG.get("direct_db_catch_enabled"):
         return False
     if session_key not in CONFIG.get("direct_db_sessions", {"a", "b"}):
         return False
 
-    doc, method = await direct_db_find_item(app, m)
+    if source_profile is None:
+        source_profile = get_direct_source_profile(m)
+
+    # In multi-bot mode, do not guess unknown bots. This prevents wrong cmd/name
+    # from being sent when a source bot is not listed in the lookup DB support bots.
+    if (
+        CONFIG.get("direct_db_use_support_bots", True)
+        and direct_supported_bots_by_id
+        and source_profile is None
+        and not CONFIG.get("direct_db_accept_unknown_source_bots", False)
+    ):
+        if CONFIG.get("direct_db_debug", True):
+            sender_ids = ",".join(str(x) for x in get_message_sender_candidates(m)) or "NONE"
+            await send_log(
+                "⏭️ <b>Direct DB skipped unsupported source bot</b>\n"
+                f"Session: <code>{html.escape(session_key)}</code>\n"
+                f"Sender IDs: <code>{html.escape(sender_ids)}</code>\n"
+                f"Group: {html.escape(group_name)}\n"
+                f"Group ID: <code>{m.chat.id}</code>",
+                parse_html=True,
+                app=app,
+            )
+        return False
+
+    doc, method = await direct_db_find_item(app, m, source_profile)
     if not doc:
         if CONFIG.get("direct_db_debug", True):
+            source_name = (source_profile or {}).get("display_name") or (source_profile or {}).get("source_bot_key") or "fallback"
             await send_log(
                 "🔎 <b>Direct DB no match</b>\n"
                 f"Session: <code>{html.escape(session_key)}</code>\n"
+                f"Source bot: <code>{html.escape(str(source_name))}</code>\n"
+                f"Source key: <code>{html.escape(str((source_profile or {}).get('source_bot_key') or ''))}</code>\n"
+                f"Command: <code>{html.escape(str((source_profile or {}).get('command_name') or CONFIG.get('direct_db_command_name', '/catch')))}</code>\n"
                 f"Method: <code>{html.escape(method)}</code>\n"
                 f"Group: {html.escape(group_name)}\n"
                 f"Group ID: <code>{m.chat.id}</code>",
@@ -1635,11 +1971,12 @@ async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optio
             )
         return False
 
-    catch_command = build_direct_catch_command(doc)
+    catch_command = build_direct_catch_command(doc, source_profile)
     if not catch_command:
         await send_log(
-            "❌ <b>Direct DB matched but command could not be built.</b>\n"
+            "❌ <b>Direct DB matched but cmd+name could not be built.</b>\n"
             f"Match method: <code>{html.escape(method)}</code>\n"
+            f"Source: <code>{html.escape(str((source_profile or {}).get('display_name') or (source_profile or {}).get('source_bot_key') or 'fallback'))}</code>\n"
             f"Doc name: <code>{html.escape(str(doc.get('name')))}</code>",
             parse_html=True,
             app=app,
@@ -1665,12 +2002,15 @@ async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optio
                 "my_message_id": sent_message.id,
                 "catch_command": catch_command,
                 "direct_db": True,
+                "source_bot_key": str((source_profile or {}).get("source_bot_key") or doc.get("source_bot_key") or ""),
+                "source_command_name": str((source_profile or {}).get("command_name") or doc.get("command_name") or CONFIG.get("direct_db_command_name", "/catch")),
             },
         )
 
         await send_log(
-            "⚡ <b>Direct DB catch command sent</b>\n"
+            "⚡ <b>Direct DB cmd+name sent</b>\n"
             f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Source bot: <code>{html.escape(str((source_profile or {}).get('display_name') or (source_profile or {}).get('source_bot_key') or 'fallback'))}</code>\n"
             f"Character: {html.escape(str(doc.get('name') or 'Unknown'))}\n"
             f"Anime: {html.escape(str(doc.get('anime_name') or 'Unknown'))}\n"
             f"Rarity: {html.escape(str(rarity or 'Unknown'))}\n"
@@ -1703,7 +2043,6 @@ async def handle_direct_db_catch(app: Client, session_key: str, m, rarity: Optio
         logging.warning("Direct DB catch send failed: %s", e)
         await send_log(f"❌ Direct DB catch send error: <code>{html.escape(str(e))}</code>", parse_html=True, app=app)
         return True
-
 
 
 def get_message_sender_candidates(m) -> list[int]:
@@ -1744,6 +2083,17 @@ def get_message_sender_candidates(m) -> list[int]:
 
 
 def is_source_bot_message(m) -> bool:
+    sender_ids = get_message_sender_candidates(m)
+
+    # Multi support-bot mode: accept only bot IDs loaded from lookup DB.
+    if CONFIG.get("direct_db_catch_enabled") and CONFIG.get("direct_db_use_support_bots", True):
+        if any(int(sender_id) in direct_supported_bots_by_id for sender_id in sender_ids):
+            return True
+
+        if CONFIG.get("direct_db_accept_unknown_source_bots", False):
+            return bool((getattr(m, "from_user", None) and m.from_user.is_bot) or getattr(m, "sender_chat", None))
+
+    # Backward-compatible one source bot mode.
     bot_id = CONFIG.get("bot_id")
     if not bot_id:
         return False
@@ -1751,7 +2101,7 @@ def is_source_bot_message(m) -> bool:
     if not CONFIG.get("source_bot_strict", True):
         return bool((getattr(m, "from_user", None) and m.from_user.is_bot) or getattr(m, "sender_chat", None))
 
-    return int(bot_id) in get_message_sender_candidates(m)
+    return int(bot_id) in sender_ids
 
 
 async def log_auto_skip_debug(app: Client, session_key: str, m, reason: str, extra: str = "") -> None:
@@ -1790,7 +2140,7 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     bot_id = CONFIG.get("bot_id")
     responder_bot_id = CONFIG.get("responder_bot_id")
 
-    if not bot_id:
+    if not CONFIG.get("direct_db_catch_enabled") and not bot_id:
         return
 
     if not responder_bot_id and not CONFIG.get("direct_db_catch_enabled"):
@@ -1808,6 +2158,7 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
         return
 
     message_text = get_message_text(m)
+    source_profile = get_direct_source_profile(m) if CONFIG.get("direct_db_catch_enabled") else None
 
     if not is_source_bot_message(m):
         await log_auto_skip_debug(app, session_key, m, "sender_mismatch")
@@ -1851,11 +2202,14 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
         return
 
     if CONFIG.get("direct_db_catch_enabled"):
-        direct_sent = await handle_direct_db_catch(app, session_key, m, rarity, group_name)
+        direct_sent = await handle_direct_db_catch(app, session_key, m, rarity, group_name, source_profile)
         if direct_sent:
             return
         if not CONFIG.get("direct_db_fallback_to_responder", False):
             return
+
+    if not responder_bot_id:
+        return
 
     try:
         forwarded = await app.forward_messages(
