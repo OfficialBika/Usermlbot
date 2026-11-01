@@ -30,7 +30,7 @@ OWNER_IDS=123456789
 GROUP_IDS=-1001234567890
 ```
 
-Never commit your real `.env`, session strings, API hash, MongoDB URI, or other credentials.
+Never commit your real `.env`, session strings, API hash, MongoDB URI, or other credentials. The root `config.json.example` is retained only as a clearly marked legacy reference; the current application does not load it. Use `.env.example` instead.
 
 ### Safe defaults
 
