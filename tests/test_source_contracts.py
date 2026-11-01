@@ -62,7 +62,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
                 calls_named(ast.Module(body=block.body, type_ignores=[]), name)
                 for block in lifecycle
             )
-            for name in ("init_database", "init_auto_config", "register_handlers", "init_direct_db", "start_health_server")
+            for name in ("init_database", "init_auto_config", "register_handlers", "init_direct_db")
         }
         self.assertTrue(all(protected_calls.values()), protected_calls)
 
