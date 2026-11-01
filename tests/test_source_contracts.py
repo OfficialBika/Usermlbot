@@ -142,6 +142,29 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertLess(min(node.lineno for node in gathers), stop_gather.lineno)
         self.assertLess(stop_gather.lineno, min(node.lineno for node in close_calls))
 
+    def test_timed_out_captcha_worker_keeps_concurrency_slot_until_exit(self):
+        function = top_level_function("run_cpu_solver")
+        self.assertTrue(any(
+            isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and node.value.func.attr == "acquire"
+            for node in ast.walk(function)
+        ))
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "shield"
+            for node in ast.walk(function)
+        ))
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_done_callback"
+            for node in ast.walk(function)
+        ))
+        self.assertIn("release_when_worker_finishes", ast.unparse(function))
+
     def test_captcha_cpu_solver_functions_remain_synchronous(self):
         for name in ("get_captcha_best_guess", "solve_captcha_image_auto"):
             function = top_level_function(name)
