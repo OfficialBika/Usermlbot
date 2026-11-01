@@ -665,34 +665,46 @@ def init_database() -> None:
     db_conn.commit()
 
 
-async def db_execute(query: str, params: tuple = ()) -> None:
+def _db_execute_sync(query: str, params: tuple = ()) -> None:
+    """Run one SQLite write on the worker thread while the async lock is held."""
     if db_conn is None:
         return
+    cur = db_conn.cursor()
+    cur.execute(query, params)
+    db_conn.commit()
 
+
+def _db_fetchall_sync(query: str, params: tuple = ()) -> list[tuple]:
+    """Run one SQLite read on the worker thread while the async lock is held."""
+    if db_conn is None:
+        return []
+    cur = db_conn.cursor()
+    cur.execute(query, params)
+    return cur.fetchall()
+
+
+def _db_fetchone_sync(query: str, params: tuple = ()) -> Optional[tuple]:
+    """Run one SQLite read on the worker thread while the async lock is held."""
+    if db_conn is None:
+        return None
+    cur = db_conn.cursor()
+    cur.execute(query, params)
+    return cur.fetchone()
+
+
+async def db_execute(query: str, params: tuple = ()) -> None:
     async with db_lock:
-        cur = db_conn.cursor()
-        cur.execute(query, params)
-        db_conn.commit()
+        await asyncio.to_thread(_db_execute_sync, query, params)
 
 
 async def db_fetchall(query: str, params: tuple = ()) -> list[tuple]:
-    if db_conn is None:
-        return []
-
     async with db_lock:
-        cur = db_conn.cursor()
-        cur.execute(query, params)
-        return cur.fetchall()
+        return await asyncio.to_thread(_db_fetchall_sync, query, params)
 
 
 async def db_fetchone(query: str, params: tuple = ()) -> Optional[tuple]:
-    if db_conn is None:
-        return None
-
     async with db_lock:
-        cur = db_conn.cursor()
-        cur.execute(query, params)
-        return cur.fetchone()
+        return await asyncio.to_thread(_db_fetchone_sync, query, params)
 
 
 async def log_caught_character(name: str, rarity: str, anime: str, group_id: int) -> None:
@@ -3500,9 +3512,10 @@ def _load_learned_digit_templates_sync() -> dict[str, list[Any]]:
         _LEARNED_DIGIT_TEMPLATE_CACHE = cache
         return cache
     try:
-        cur = db_conn.cursor()
-        cur.execute("SELECT digit, template FROM captcha_digit_templates ORDER BY id DESC LIMIT 3000")
-        for digit, blob in cur.fetchall():
+        rows = _db_fetchall_sync(
+            "SELECT digit, template FROM captcha_digit_templates ORDER BY id DESC LIMIT 3000"
+        )
+        for digit, blob in rows:
             digit = str(digit)
             if digit not in cache:
                 continue
@@ -3513,6 +3526,64 @@ def _load_learned_digit_templates_sync() -> dict[str, list[Any]]:
         logging.warning("load learned captcha templates failed: %s", e)
     _LEARNED_DIGIT_TEMPLATE_CACHE = cache
     return cache
+
+
+def _save_captcha_templates_sync(
+    answer: str,
+    crops: list[Any],
+    session_key: str,
+    chat_id: int,
+    message_id: int,
+    limit: int,
+) -> bool:
+    """Persist learned captcha templates while the shared SQLite lock is held."""
+    if db_conn is None:
+        return False
+    cur = db_conn.cursor()
+    for digit, crop in zip(answer, crops):
+        blob = _template_to_blob(crop)
+        if not blob:
+            continue
+        cur.execute(
+            """
+            INSERT INTO captcha_digit_templates
+            (created_at, digit, template, width, height, answer, source_session, source_chat_id, source_message_id)
+            VALUES (?, ?, ?, 32, 32, ?, ?, ?, ?)
+            """,
+            (now_local_str(), digit, blob, answer, session_key, int(chat_id), int(message_id)),
+        )
+        cur.execute(
+            """
+            DELETE FROM captcha_digit_templates
+            WHERE digit = ? AND id NOT IN (
+                SELECT id FROM captcha_digit_templates
+                WHERE digit = ? ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (digit, digit, limit),
+        )
+    db_conn.commit()
+    return True
+
+
+async def _save_captcha_templates(
+    answer: str,
+    crops: list[Any],
+    session_key: str,
+    chat_id: int,
+    message_id: int,
+    limit: int,
+) -> bool:
+    async with db_lock:
+        return await asyncio.to_thread(
+            _save_captcha_templates_sync,
+            answer,
+            crops,
+            session_key,
+            chat_id,
+            message_id,
+            limit,
+        )
 
 
 def _extract_four_digit_crops_for_learning(img) -> Optional[list[Any]]:
@@ -3582,33 +3653,9 @@ async def save_learned_captcha_templates_from_image(img, answer: str, session_ke
         )
         return False
     limit = int(CONFIG.get("captcha_learn_template_limit_per_digit", 200))
-    async with db_lock:
-        if db_conn is None:
-            return False
-        cur = db_conn.cursor()
-        for digit, crop in zip(answer, crops):
-            blob = _template_to_blob(crop)
-            if not blob:
-                continue
-            cur.execute(
-                """
-                INSERT INTO captcha_digit_templates
-                (created_at, digit, template, width, height, answer, source_session, source_chat_id, source_message_id)
-                VALUES (?, ?, ?, 32, 32, ?, ?, ?, ?)
-                """,
-                (now_local_str(), digit, blob, answer, session_key, int(chat_id), int(message_id)),
-            )
-            cur.execute(
-                """
-                DELETE FROM captcha_digit_templates
-                WHERE digit = ? AND id NOT IN (
-                    SELECT id FROM captcha_digit_templates
-                    WHERE digit = ? ORDER BY id DESC LIMIT ?
-                )
-                """,
-                (digit, digit, limit),
-            )
-        db_conn.commit()
+    await _save_captcha_templates(
+        answer, crops, session_key, chat_id, message_id, limit
+    )
     _LEARNED_DIGIT_TEMPLATE_CACHE = None
     return True
 
