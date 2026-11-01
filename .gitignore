@@ -22,10 +22,6 @@ data/catch_history.db-*
 logs/*.log
 captcha_debug/
 captcha_debug_*/
-*.png
-*.jpg
-*.jpeg
-
 # Python environments and generated files
 .venv/
 venv/
