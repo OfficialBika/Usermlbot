@@ -1,135 +1,144 @@
-# Usermlbot VPS Env Version
+# Usermlbot
 
-This package is a VPS-ready version of the original `OfficialBika/Usermlbot` repo.
-
-## What changed
-- Removed `config.json`
-- Uses environment variables only
-- Uses Pyrogram `session_string` instead of `.session` files
-- Keeps a simple `/health` endpoint in case you want to test locally or proxy it later
-- Added `systemd` service file for Ubuntu VPS
-- Added `run.sh` helper
+A Pyrogram-based Telegram userbot with human-chat sessions, optional auto-catch/forward features, optional read-only MongoDB lookup, and an optional captcha solver.
 
 ## Requirements
-- Ubuntu 22.04 / 24.04 VPS
-- Python 3.10+
-- Git
-- A Telegram API ID and API hash
-- Two Pyrogram string sessions
 
-## Files
-- `main.py` -> bot entrypoint
-- `.env.example` -> environment variable template
-- `run.sh` -> helper to start manually
-- `usermlbot.service` -> systemd service example
-- `locales/sessa.txt` and `locales/sessb.txt` -> reply text pools
+- Python 3.10 or newer (Python 3.11 is used by the Render Blueprint).
+- A Telegram API ID and API hash from Telegram.
+- Two Pyrogram string sessions (Session A and Session B).
+- Owner Telegram user ID and at least one monitored group ID.
+- Optional: MongoDB URI/database if Direct DB Catch is enabled.
 
-## 1) Upload or clone to VPS
-```bash
-git clone https://github.com/OfficialBika/Usermlbot.git
-cd Usermlbot
-```
+## Configuration
 
-Then replace the repo files with the files from this package.
+Create your environment file from the committed template:
 
-## 2) Install Python and create venv
-```bash
-sudo apt update
-sudo apt install -y python3 python3-pip python3-venv git
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-## 3) Create `.env`
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Fill in:
+Fill in the required values:
+
 ```env
 API_ID=12345678
 API_HASH=your_api_hash
-SESSION_A_STRING=your_pyrogram_string_session_a
-SESSION_B_STRING=your_pyrogram_string_session_b
-OWNER_ID=123456789
-GROUP_ID=-1001234567890
-ENABLE_TWO_WAY=false
-MIN_REPLY_DELAY=8
-MAX_REPLY_DELAY=12
-DEBUG=false
-HOST=0.0.0.0
-PORT=10000
+SESSION_A_STRING=your_session_a_string
+SESSION_B_STRING=your_session_b_string
+OWNER_IDS=123456789
+GROUP_IDS=-1001234567890
 ```
 
-## 4) Start manually for testing
+Never commit your real `.env`, session strings, API hash, MongoDB URI, or other credentials.
+
+### Safe defaults
+
+The example keeps optional automation disabled:
+
+- `AUTO_FORWARD_ENABLED=false`
+- `DIRECT_DB_CATCH_ENABLED=false`
+- `CAPTCHA_SOLVER_ENABLED=false`
+- `CAPTCHA_AUTO_APPROVE=false`
+
+Enable each feature only after its required IDs, target groups, source configuration, and behavior have been verified. Captcha auto-approval should remain disabled unless you have validated solver accuracy and risk controls.
+
+### Session behavior
+
+- Session A and B are required.
+- Session C and D are optional and intended for human-chat use.
+- `HUMAN_CHAT_SESSIONS` can include `a,b,c,d`.
+- Auto-catch and captcha solver session settings intentionally allow only A/B.
+
+### Auto-forward requirements
+
+When `AUTO_FORWARD_ENABLED=true` and `DIRECT_DB_CATCH_ENABLED=false`, configure:
+
+```env
+BOT_ID=123456789
+RESPONDER_BOT_ID=123456789
+```
+
+Alternatively, use `RESPONDER_BOT_IDS` for multiple responder bots. When Direct DB Catch is enabled, configure a MongoDB URI and database name as well.
+
+Direct DB Catch uses MongoDB as a read-only lookup source. The bot does not create indexes or write application documents to that database.
+
+## Install on Ubuntu VPS
+
 ```bash
-source venv/bin/activate
-export $(grep -v '^#' .env | xargs)
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git
+git clone https://github.com/OfficialBika/Usermlbot.git
+cd Usermlbot
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+nano .env
 python main.py
 ```
 
-## 5) Run with systemd
-Edit the service file path first:
-```bash
-nano usermlbot.service
+Keep the `.venv`, `.env`, `data/`, and database files in the deployment directory. The application creates its data directory when it starts.
+
+## Render deployment
+
+The repository includes `render.yaml` with:
+
+- Web service start command: `python main.py`
+- Health check path: `/health`
+- Bind address: `0.0.0.0`
+- Port: Render-provided `PORT` (fallback 10000 for local use)
+
+Set all required Telegram credentials and IDs in Render's environment settings. Do not place secrets in `render.yaml`.
+
+The health endpoint returns HTTP 200 only after both required Telegram sessions are connected. It returns HTTP 503 while starting or if either required session is disconnected. Render deployment and live health still need to be verified in the Render dashboard after pushing changes.
+
+## systemd deployment
+
+The included `usermlbot.service` is an example, not a universal fixed path. Before installing it, edit these values to match your actual VPS user and directory:
+
+- `User` and `Group`
+- `WorkingDirectory`
+- `EnvironmentFile`
+- `ExecStart` (use the Python executable inside your virtual environment)
+
+For example, if the repository is under `/home/bika/Usermlbot`:
+
+```ini
+[Service]
+User=bika
+Group=bika
+WorkingDirectory=/home/bika/Usermlbot
+EnvironmentFile=/home/bika/Usermlbot/.env
+ExecStart=/home/bika/Usermlbot/.venv/bin/python -u /home/bika/Usermlbot/main.py
+Restart=on-failure
+RestartSec=5
 ```
 
-Make sure these match your VPS setup:
-- `WorkingDirectory=/home/ubuntu/Usermlbot`
-- `ExecStart=/home/ubuntu/Usermlbot/venv/bin/python /home/ubuntu/Usermlbot/main.py`
-- `EnvironmentFile=/home/ubuntu/Usermlbot/.env`
-- `User=ubuntu`
+Install and start only after verifying the paths and ownership:
 
-Install service:
 ```bash
 sudo cp usermlbot.service /etc/systemd/system/usermlbot.service
 sudo systemctl daemon-reload
-sudo systemctl enable usermlbot
-sudo systemctl start usermlbot
-```
-
-Check logs:
-```bash
+sudo systemctl enable --now usermlbot
 sudo systemctl status usermlbot
 journalctl -u usermlbot -f
 ```
 
-Restart after changes:
-```bash
-sudo systemctl restart usermlbot
-```
+## Persistent files
 
-## 6) Session strings
-You said you will get string sessions from a Telegram bot and put them into env.
-That is technically possible.
+By default, runtime settings are stored in `bot_config.json` and history/template records in `catch_history.db`. You can move both into a persistent directory using `DATA_DIR`, and override the filenames with `BOT_CONFIG_FILE` and `DB_FILE`.
 
-Use them like this in `.env`:
-```env
-SESSION_A_STRING=...
-SESSION_B_STRING=...
-```
+For Render, note that filesystem persistence depends on the service's configured persistent disk. Without persistent storage, local SQLite history and saved auto-config may be lost on instance replacement or redeploy. Configure a disk and a matching `DATA_DIR` before relying on local persistence.
 
-## Important security warning
-A third-party Telegram bot can steal or reuse:
-- API ID / API hash
-- phone number
-- OTP code
-- 2FA password
-- generated string session
+## Security notes
 
-So if you use a Telegram bot to generate sessions, do it at your own risk.
-The safer option is generating Pyrogram session strings yourself on your own VPS or PC.
+- Generate Pyrogram sessions on a trusted device or your own VPS.
+- Treat session strings as passwords: anyone with a valid session may access the Telegram account.
+- Never share OTPs, 2FA passwords, API hashes, session strings, or MongoDB credentials.
+- Keep auto-click and auto-forward features disabled until individually tested.
 
-## Bot commands
-Send these in the target group from the owner account:
-- `/open`
-- `/close`
-- `/status`
-- `/help`
+## Commands
 
-## Notes
-- VPS is better than Render free web service for this repo
-- Keep `locales/sessa.txt` and `locales/sessb.txt` filled with your reply lines
-- Keep your `.env` private
+Send supported owner commands from the configured owner account in an allowed chat. Use `/help` in Telegram for the runtime command list.
