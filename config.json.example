@@ -1,12 +1,13 @@
 {
+  "_notice": "Legacy example only. main.py reads environment variables; use .env.example instead.",
   "api_id": 12345678,
-  "api_hash": "your_api_hash",
-  "session_a": "session_a",
-  "session_b": "session_b",
-  "owner_id": 8251006975,
-  "group_id": -1003614471862,
+  "api_hash": "replace_with_telegram_api_hash",
+  "session_a": "replace_with_session_a_string",
+  "session_b": "replace_with_session_b_string",
+  "owner_id": 123456789,
+  "group_id": -1001234567890,
   "enable_two_way": false,
-  "min_reply_delay": 8,
-  "max_reply_delay": 12,
+  "min_reply_delay": 2,
+  "max_reply_delay": 4,
   "debug": false
 }
