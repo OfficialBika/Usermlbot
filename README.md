@@ -92,6 +92,8 @@ The repository includes `render.yaml` with:
 
 Set all required Telegram credentials and IDs in Render's environment settings. Do not place secrets in `render.yaml`.
 
+**Production warning:** the current Blueprint selects Render's Free web-service plan. Free web services spin down after 15 minutes without inbound traffic, and their local filesystem is ephemeral; SQLite history and runtime config can be lost when the service spins down, restarts, or redeploys. This makes the Free plan unsuitable for a continuously connected Telegram userbot. Use an always-on VPS or a paid Render instance with persistent storage instead. <Link url="https://render.com/docs/free" title="Render Free instance limitations"/>.
+
 The health endpoint returns HTTP 200 only after both required Telegram sessions are connected. It returns HTTP 503 while starting or if either required session is disconnected. Render deployment and live health still need to be verified in the Render dashboard after pushing changes.
 
 ## systemd deployment
