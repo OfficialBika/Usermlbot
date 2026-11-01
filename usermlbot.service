@@ -1,15 +1,25 @@
 [Unit]
 Description=Usermlbot Pyrogram Service
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/Usermlbot
-EnvironmentFile=/home/ubuntu/Usermlbot/.env
-ExecStart=/home/ubuntu/Usermlbot/venv/bin/python /home/ubuntu/Usermlbot/main.py
-Restart=always
+
+# Replace these placeholders with the actual VPS account and project paths.
+User=REPLACE_WITH_LINUX_USER
+Group=REPLACE_WITH_LINUX_GROUP
+WorkingDirectory=/REPLACE/WITH/PROJECT/PATH
+EnvironmentFile=/REPLACE/WITH/PROJECT/PATH/.env
+ExecStart=/REPLACE/WITH/PROJECT/PATH/.venv/bin/python -u /REPLACE/WITH/PROJECT/PATH/main.py
+
+Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=027
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
