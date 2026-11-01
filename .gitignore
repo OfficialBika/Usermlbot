@@ -1,0 +1,40 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# Runtime configuration and local databases
+bot_config.json
+config.json
+catch_history.db
+catch_history.db-*
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+data/bot_config.json
+data/catch_history.db
+data/catch_history.db-*
+
+# Logs and local debug artifacts
+logs/*.log
+captcha_debug/
+captcha_debug_*/
+*.png
+*.jpg
+*.jpeg
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
