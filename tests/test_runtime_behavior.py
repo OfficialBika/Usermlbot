@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import threading
 import unittest
 from unittest.mock import patch
@@ -61,6 +62,79 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 await first
             self.assertEqual(await second, "second")
             self.assertTrue(second_started.is_set())
+
+        asyncio.run(scenario())
+
+    def test_shutdown_closes_every_resource_even_if_one_client_stop_fails(self):
+        class FakeClient:
+            def __init__(self, fail=False):
+                self.is_connected = True
+                self.fail = fail
+                self.stop_called = False
+
+            async def stop(self):
+                self.stop_called = True
+                self.is_connected = False
+                if self.fail:
+                    raise RuntimeError("simulated stop failure")
+
+        class FakeMongoClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        async def scenario():
+            old_clients = (main.app_a, main.app_b, main.app_c, main.app_d)
+            old_db = main.db_conn
+            old_mongo = main.direct_mongo_client
+            old_items = main.direct_items_collection
+            clients = (
+                FakeClient(fail=True),
+                FakeClient(),
+                FakeClient(),
+                FakeClient(),
+            )
+            connection = sqlite3.connect(":memory:", check_same_thread=False)
+            mongo = FakeMongoClient()
+
+            main.app_a, main.app_b, main.app_c, main.app_d = clients
+            main.db_conn = connection
+            main.direct_mongo_client = mongo
+            main.direct_items_collection = object()
+            main.background_tasks.clear()
+            main.conversation_tasks.clear()
+            main.enabled_groups.add(-100123)
+
+            background = main.spawn_background_task(asyncio.sleep(30))
+            conversation = asyncio.create_task(asyncio.sleep(30))
+            main.conversation_tasks[-100123] = conversation
+
+            try:
+                await main.shutdown_clients()
+                await asyncio.sleep(0)
+
+                self.assertTrue(all(client.stop_called for client in clients))
+                self.assertTrue(background.cancelled())
+                self.assertTrue(conversation.cancelled())
+                self.assertFalse(main.background_tasks)
+                self.assertFalse(main.conversation_tasks)
+                self.assertNotIn(-100123, main.enabled_groups)
+                self.assertIsNone(main.db_conn)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+                self.assertTrue(mongo.closed)
+                self.assertIsNone(main.direct_mongo_client)
+                self.assertIsNone(main.direct_items_collection)
+            finally:
+                main.app_a, main.app_b, main.app_c, main.app_d = old_clients
+                main.db_conn = old_db
+                main.direct_mongo_client = old_mongo
+                main.direct_items_collection = old_items
+                main.background_tasks.clear()
+                main.conversation_tasks.clear()
+                main.enabled_groups.discard(-100123)
 
         asyncio.run(scenario())
 
