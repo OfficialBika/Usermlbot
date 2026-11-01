@@ -50,4 +50,5 @@ jobs:
           python -m pip install pyrofork==2.3.69 python-dotenv aiohttp motor numpy opencv-python-headless pytesseract Pillow ImageHash
 
       - name: Import application module
-        run: python -c "import main; print('Usermlbot module import: OK')"
+        run: |
+          python -c 'import main; print("Usermlbot module import: OK")'
