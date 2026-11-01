@@ -662,52 +662,52 @@ def init_database() -> None:
         cursor = connection.cursor()
 
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS caught_characters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            catch_date TEXT,
-            character_name TEXT,
-            rarity TEXT,
-            anime TEXT,
-            status TEXT,
-            group_id INTEGER
-        )
-    """)
+            CREATE TABLE IF NOT EXISTS caught_characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                catch_date TEXT,
+                character_name TEXT,
+                rarity TEXT,
+                anime TEXT,
+                status TEXT,
+                group_id INTEGER
+            )
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS failed_attempts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            attempt_date TEXT,
-            character_name TEXT,
-            reason TEXT,
-            group_id INTEGER
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS failed_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempt_date TEXT,
+                character_name TEXT,
+                reason TEXT,
+                group_id INTEGER
+            )
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ignored_characters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ignore_date TEXT,
-            character_name TEXT,
-            rarity TEXT,
-            reason TEXT,
-            group_id INTEGER
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ignored_characters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ignore_date TEXT,
+                character_name TEXT,
+                rarity TEXT,
+                reason TEXT,
+                group_id INTEGER
+            )
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS captcha_digit_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT,
-            digit TEXT NOT NULL,
-            template BLOB NOT NULL,
-            width INTEGER NOT NULL DEFAULT 32,
-            height INTEGER NOT NULL DEFAULT 32,
-            answer TEXT,
-            source_session TEXT,
-            source_chat_id INTEGER,
-            source_message_id INTEGER
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS captcha_digit_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                digit TEXT NOT NULL,
+                template BLOB NOT NULL,
+                width INTEGER NOT NULL DEFAULT 32,
+                height INTEGER NOT NULL DEFAULT 32,
+                answer TEXT,
+                source_session TEXT,
+                source_chat_id INTEGER,
+                source_message_id INTEGER
+            )
+        """)
 
         connection.commit()
     except Exception:
@@ -716,7 +716,6 @@ def init_database() -> None:
         finally:
             db_conn = None
         raise
-
 
 def _db_execute_sync(query: str, params: tuple = ()) -> None:
     """Run one SQLite write on the worker thread while the async lock is held."""
