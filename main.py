@@ -2015,7 +2015,7 @@ async def load_direct_support_bots() -> None:
     )
 
 async def init_direct_db() -> None:
-    global direct_mongo_client, direct_items_collection
+    global direct_mongo_client, direct_items_collection, direct_support_bots_collection
 
     if not CONFIG.get("direct_db_catch_enabled"):
         return
