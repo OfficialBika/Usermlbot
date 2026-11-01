@@ -3666,7 +3666,7 @@ async def save_learned_captcha_templates_from_image(img, answer: str, session_ke
     return True
 
 
-def solve_by_learned_template_match(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+async def solve_by_learned_template_match(img, options: list[str]) -> Optional[tuple[str, float, str]]:
     if not captcha_cv_ready() or img is None:
         return None
     options = [normalize_option(x) for x in options if is_numeric_option(str(x))]
@@ -4112,7 +4112,7 @@ def get_captcha_best_guess(img, options: list[str]) -> Optional[tuple[str, float
             candidates.append((answer, min(0.99, max(0.85, conf)), "plain_image_marker"))
 
     try:
-        learned = solve_by_learned_template_match(img, options)
+        learned = await solve_by_learned_template_match(img, options)
         if learned:
             candidates.append(learned)
     except Exception:
@@ -4182,7 +4182,7 @@ def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, flo
     # 2) Learned local template matcher. This becomes the most accurate method after
     # you correct/train several captchas with /captcha_answer 1234.
     try:
-        learned_result = solve_by_learned_template_match(img, options)
+        learned_result = await solve_by_learned_template_match(img, options)
     except Exception as e:
         logging.warning("learned_template_match failed: %s", e)
         learned_result = None
