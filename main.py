@@ -158,11 +158,32 @@ captcha_solver_semaphore = asyncio.Semaphore(CAPTCHA_SOLVER_CONCURRENCY)
 
 
 async def run_cpu_solver(func, *args, timeout: Optional[float] = None):
-    async with captcha_solver_semaphore:
-        coro = asyncio.to_thread(func, *args)
-        if timeout and timeout > 0:
-            return await asyncio.wait_for(coro, timeout=timeout)
-        return await coro
+    await captcha_solver_semaphore.acquire()
+    worker = asyncio.create_task(asyncio.to_thread(func, *args))
+    release_when_worker_finishes = False
+
+    def _release_slot(done: asyncio.Task) -> None:
+        if not done.cancelled():
+            try:
+                done.exception()
+            except asyncio.CancelledError:
+                pass
+        captcha_solver_semaphore.release()
+
+    try:
+        try:
+            if timeout and timeout > 0:
+                return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout)
+            return await asyncio.shield(worker)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # Cancelling a to_thread await does not stop its OS thread. Keep the
+            # concurrency slot occupied until that worker actually exits.
+            release_when_worker_finishes = True
+            worker.add_done_callback(_release_slot)
+            raise
+    finally:
+        if not release_when_worker_finishes:
+            captcha_solver_semaphore.release()
 
 
 def spawn_background_task(coro, *, name: Optional[str] = None) -> asyncio.Task:
