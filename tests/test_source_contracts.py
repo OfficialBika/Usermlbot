@@ -59,12 +59,8 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertTrue(lifecycle, "main() must call shutdown_clients() in a finally block")
         protected_calls = {
             name: any(
-                isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Name)
-                and item.func.id == name
+                calls_named(ast.Module(body=block.body, type_ignores=[]), name)
                 for block in lifecycle
-                for item in ast.walk(block)
-                if item in block.body
             )
             for name in ("init_database", "init_auto_config", "register_handlers", "init_direct_db", "start_health_server")
         }
@@ -111,21 +107,38 @@ class RuntimeSafetyContracts(unittest.TestCase):
 
     def test_shutdown_cancels_tasks_before_stopping_clients_and_closing_db(self):
         shutdown = top_level_function("shutdown_clients")
-        line_for = {}
-        for name in ("cancel", "gather", "stop", "_await_thread_completion"):
-            matches = [
-                node.lineno for node in ast.walk(shutdown)
-                if isinstance(node, ast.Call)
-                and (
-                    (isinstance(node.func, ast.Attribute) and node.func.attr == name)
-                    or (isinstance(node.func, ast.Name) and node.func.id == name)
+        cancel_calls = [
+            node for node in ast.walk(shutdown)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "cancel"
+        ]
+        gathers = [
+            node for node in ast.walk(shutdown)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "gather"
+        ]
+        stop_gather = next(
+            (
+                node for node in gathers
+                if any(
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Name)
+                    and child.func.id == "_stop_client"
+                    for child in ast.walk(node)
                 )
-            ]
-            self.assertTrue(matches, name)
-            line_for[name] = min(matches)
-        self.assertLess(line_for["cancel"], line_for["gather"])
-        self.assertLess(line_for["gather"], line_for["stop"])
-        self.assertLess(line_for["stop"], line_for["_await_thread_completion"])
+            ),
+            None,
+        )
+        close_calls = calls_named(shutdown, "_await_thread_completion")
+        self.assertTrue(cancel_calls)
+        self.assertGreaterEqual(len(gathers), 2)
+        self.assertIsNotNone(stop_gather)
+        self.assertTrue(close_calls)
+        self.assertLess(min(node.lineno for node in cancel_calls), min(node.lineno for node in gathers))
+        self.assertLess(max(node.lineno for node in gathers), stop_gather.lineno)
+        self.assertLess(stop_gather.lineno, min(node.lineno for node in close_calls))
 
     def test_captcha_cpu_solver_functions_remain_synchronous(self):
         for name in ("get_captcha_best_guess", "solve_captcha_image_auto"):
