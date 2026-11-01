@@ -200,22 +200,12 @@ class RuntimeSafetyContracts(unittest.TestCase):
             for node in ast.walk(function)
         ))
 
-    def test_health_server_is_opt_in_and_disabled_for_vps_by_default(self):
-        self.assertIn('application.router.add_get("/health", health_check)', SOURCE)
-        main = top_level_function("main")
-        self.assertTrue(any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "getenv_bool"
-            and len(node.args) >= 2
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == "ENABLE_HEALTH_SERVER"
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value is False
-            for node in ast.walk(main)
-        ))
-        self.assertIn("ENABLE_HEALTH_SERVER=false", ENV_EXAMPLE)
-        self.assertIn("HOST=127.0.0.1", ENV_EXAMPLE)
+    def test_vps_runtime_does_not_open_an_http_listener(self):
+        self.assertNotIn("aiohttp", SOURCE)
+        self.assertNotIn("start_health_server", SOURCE)
+        self.assertNotIn("ENABLE_HEALTH_SERVER", ENV_EXAMPLE)
+        self.assertNotIn("HOST=", ENV_EXAMPLE)
+        self.assertNotIn("PORT=", ENV_EXAMPLE)
 
     def test_systemd_unit_targets_vps_user_and_graceful_shutdown(self):
         service = (ROOT / "usermlbot.service").read_text(encoding="utf-8")
