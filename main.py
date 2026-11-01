@@ -5982,7 +5982,10 @@ async def main() -> None:
         spawn_background_task(captcha_cleanup_loop(), name="captcha-cleanup")
         spawn_background_task(warmup_captcha_engines(), name="captcha-warmup")
 
-        health_server = await start_health_server()
+        if getenv_bool("ENABLE_HEALTH_SERVER", False):
+            health_server = await start_health_server()
+        else:
+            logging.info("HTTP health server disabled (ENABLE_HEALTH_SERVER=false)")
         await idle()
     finally:
         if health_server is not None:
