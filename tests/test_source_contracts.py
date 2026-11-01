@@ -96,8 +96,10 @@ class RuntimeSafetyContracts(unittest.TestCase):
         cancellation_handlers = [
             handler for node in ast.walk(helper) if isinstance(node, ast.Try)
             for handler in node.handlers
-            if handler.type and isinstance(handler.type, ast.Name)
-            and handler.type.id == "CancelledError"
+            if (
+                isinstance(handler.type, ast.Attribute)
+                and handler.type.attr == "CancelledError"
+            )
         ]
         self.assertTrue(cancellation_handlers)
         self.assertTrue(any(
