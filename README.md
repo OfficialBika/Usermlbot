@@ -10,20 +10,20 @@ A Pyrogram-based Telegram userbot with human-chat sessions, optional auto-catch/
 - Telegram API ID/hash and two Pyrogram string sessions (A and B).
 - Owner Telegram user ID and at least one monitored group ID.
 - Optional: MongoDB URI/database only if Direct DB Catch is enabled.
-- Optional: \`tesseract-ocr\` system package for Tesseract OCR fallback.
+- Optional: `tesseract-ocr` system package for Tesseract OCR fallback.
 
 The repository CI checks Python syntax and source-level regression contracts on Python 3.11 and 3.12. The VPS guide below uses Python 3.12, which is the native Python version on Ubuntu 24.04. Avoid using an experimental Python version for production until all native dependencies (especially PyTorch/EasyOCR and TgCrypto) have compatible wheels.
 
 ## 1. Prepare the VPS
 
 The commands below assume:
-- Linux account: \`bika\`
-- Project directory: \`/home/bika/Usermlbot\`
-- Virtual environment: \`/home/bika/Usermlbot/.venv\`
+- Linux account: `bika`
+- Project directory: `/home/bika/Usermlbot`
+- Virtual environment: `/home/bika/Usermlbot/.venv`
 
 Change the account and paths if your VPS uses a different layout.
 
-\`\`\`bash
+```bash
 sudo apt update
 sudo apt install -y git python3.12 python3.12-venv python3-pip tesseract-ocr
 sudo -u bika -H bash
@@ -34,40 +34,39 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip wheel
 python -m pip install -r requirements.txt
-\`\`\`
+```
 
 If the repository is already cloned, do not clone it again. Enter the existing project directory and continue from virtual-environment setup.
 
 ## 2. Configure credentials
 
-\`\`\`bash
+```bash
 cp .env.example .env
 nano .env
 chmod 600 .env
-\`\`\`
+```
 
 Fill in the required values:
 
-\`\`\`env
+```env
 API_ID=12345678
 API_HASH=your_api_hash
 SESSION_A_STRING=your_session_a_string
 SESSION_B_STRING=your_session_b_string
 OWNER_IDS=123456789
 GROUP_IDS=-1001234567890
-\`\`\`
+```
 
-Never commit or share \`.env\`, session strings, API hash, MongoDB URI, OTPs, or 2FA passwords. The root \`config.json.example\` is a legacy reference; the current application uses \`.env.example\`.
+Never commit or share `.env`, session strings, API hash, MongoDB URI, OTPs, or 2FA passwords. The root `config.json.example` is a legacy reference; the current application uses `.env.example`.
 
 ### Safe feature defaults
 
 The example keeps optional automation disabled:
 
-- \`AUTO_FORWARD_ENABLED=false\`
-- \`DIRECT_DB_CATCH_ENABLED=false\`
-- \`CAPTCHA_SOLVER_ENABLED=false\`
-- \`CAPTCHA_AUTO_APPROVE=false\`
-- \`ENABLE_HEALTH_SERVER=false\`
+- `AUTO_FORWARD_ENABLED=false`
+- `DIRECT_DB_CATCH_ENABLED=false`
+- `CAPTCHA_SOLVER_ENABLED=false`
+- `CAPTCHA_AUTO_APPROVE=false`
 
 Enable optional features only after their IDs, target groups, sources, and behavior have been checked. Keep captcha auto-approval disabled unless solver accuracy and risk controls have been validated.
 
@@ -75,77 +74,75 @@ Enable optional features only after their IDs, target groups, sources, and behav
 
 - Session A and B are required.
 - Session C and D are optional and intended for human-chat use.
-- \`HUMAN_CHAT_SESSIONS\` can include \`a,b,c,d\`.
+- `HUMAN_CHAT_SESSIONS` can include `a,b,c,d`.
 - Auto-catch and captcha solver session settings intentionally allow only A/B.
 
 ### Auto-forward requirements
 
-When \`AUTO_FORWARD_ENABLED=true\` and \`DIRECT_DB_CATCH_ENABLED=false\`, configure:
+When `AUTO_FORWARD_ENABLED=true` and `DIRECT_DB_CATCH_ENABLED=false`, configure:
 
-\`\`\`env
+```env
 BOT_ID=123456789
 RESPONDER_BOT_ID=123456789
-\`\`\`
+```
 
-Alternatively, use \`RESPONDER_BOT_IDS\` for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
+Alternatively, use `RESPONDER_BOT_IDS` for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
 
 ## 3. Test manually before systemd
 
 Run from the project directory with the virtual environment active:
 
-\`\`\`bash
+```bash
 cd /home/bika/Usermlbot
 source .venv/bin/activate
 python -m compileall -q main.py
 python main.py
-\`\`\`
+```
 
 Confirm both required Telegram sessions connect and the startup summary is delivered. Press Ctrl+C once and confirm the process exits cleanly. Do not enable the systemd service until this manual test succeeds.
 
-The VPS default does not open an HTTP listener. If you explicitly need a local health endpoint, set \`ENABLE_HEALTH_SERVER=true\` and keep \`HOST=127.0.0.1\`; do not expose it publicly without a separate security requirement.
-
 ## 4. Install and run with systemd
 
-The committed \`usermlbot.service\` is configured for the example account and path above. Verify that the Linux account exists and owns the project files:
+The committed `usermlbot.service` is configured for the example account and path above. Verify that the Linux account exists and owns the project files:
 
-\`\`\`bash
+```bash
 id bika
 sudo chown -R bika:bika /home/bika/Usermlbot
 chmod 600 /home/bika/Usermlbot/.env
-\`\`\`
+```
 
 Install and start:
 
-\`\`\`bash
+```bash
 sudo cp /home/bika/Usermlbot/usermlbot.service /etc/systemd/system/usermlbot.service
 sudo systemd-analyze verify /etc/systemd/system/usermlbot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now usermlbot
 sudo systemctl status usermlbot --no-pager
-\`\`\`
+```
 
 View live logs:
 
-\`\`\`bash
+```bash
 sudo journalctl -u usermlbot -f
-\`\`\`
+```
 
 Useful service commands:
 
-\`\`\`bash
+```bash
 sudo systemctl restart usermlbot
 sudo systemctl stop usermlbot
 sudo systemctl start usermlbot
 sudo systemctl is-enabled usermlbot
-\`\`\`
+```
 
-The service runs as the unprivileged \`bika\` account, restarts after unexpected failures, and sends SIGINT on stop so Python's asyncio runner can execute the application's graceful cleanup. Keep \`DATA_DIR\`, \`.env\`, and the virtual environment accessible to that account.
+The service runs as the unprivileged `bika` account, restarts after unexpected failures, and sends SIGINT on stop so Python's asyncio runner can execute the application's graceful cleanup. Keep `DATA_DIR`, `.env`, and the virtual environment accessible to that account.
 
 ## 5. Update safely
 
 Back up runtime state before updating:
 
-\`\`\`bash
+```bash
 sudo systemctl stop usermlbot
 cd /home/bika/Usermlbot
 mkdir -p /home/bika/backups
@@ -156,21 +153,21 @@ python -m pip install -r requirements.txt
 python -m compileall -q main.py
 sudo systemctl start usermlbot
 sudo systemctl status usermlbot --no-pager
-\`\`\`
+```
 
 If the service does not start, inspect:
 
-\`\`\`bash
+```bash
 sudo journalctl -u usermlbot -n 200 --no-pager
-\`\`\`
+```
 
-Do not delete \`data/\`, \`catch_history.db\`, or \`bot_config.json\` during updates; they contain runtime state and history.
+Do not delete `data/`, `catch_history.db`, or `bot_config.json` during updates; they contain runtime state and history.
 
 ## Persistent files
 
-By default, runtime settings are stored in \`bot_config.json\` and history/template records in \`catch_history.db\`. Both are placed under \`DATA_DIR\` (default: \`./data\`). You can set an absolute persistent directory with \`DATA_DIR\` and override filenames with \`BOT_CONFIG_FILE\` and \`DB_FILE\`.
+By default, runtime settings are stored in `bot_config.json` and history/template records in `catch_history.db`. Both are placed under `DATA_DIR` (default: `./data`). You can set an absolute persistent directory with `DATA_DIR` and override filenames with `BOT_CONFIG_FILE` and `DB_FILE`.
 
-The project directory and \`DATA_DIR\` must be writable by the service account. Back up \`data/\` regularly and keep backups outside the repository directory.
+The project directory and `DATA_DIR` must be writable by the service account. Back up `data/` regularly and keep backups outside the repository directory.
 
 ## Security notes
 
@@ -182,4 +179,4 @@ The project directory and \`DATA_DIR\` must be writable by the service account. 
 
 ## Commands
 
-Send supported owner commands from the configured owner account in an allowed chat. Use \`/help\` in Telegram for the runtime command list.
+Send supported owner commands from the configured owner account in an allowed chat. Use `/help` in Telegram for the runtime command list.
