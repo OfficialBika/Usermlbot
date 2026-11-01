@@ -96,35 +96,29 @@ The health endpoint returns HTTP 200 only after both required Telegram sessions 
 
 ## systemd deployment
 
-The included `usermlbot.service` is an example, not a universal fixed path. Before installing it, edit these values to match your actual VPS user and directory:
-
-- `User` and `Group`
-- `WorkingDirectory`
-- `EnvironmentFile`
-- `ExecStart` (use the Python executable inside your virtual environment)
-
-For example, if the repository is under `/home/bika/Usermlbot`:
+The included `usermlbot.service` is a deployment template. Replace every `REPLACE_...` value and project path before installing. The example assumes the project uses a `.venv` virtual environment:
 
 ```ini
-[Service]
 User=bika
 Group=bika
 WorkingDirectory=/home/bika/Usermlbot
 EnvironmentFile=/home/bika/Usermlbot/.env
 ExecStart=/home/bika/Usermlbot/.venv/bin/python -u /home/bika/Usermlbot/main.py
-Restart=on-failure
-RestartSec=5
 ```
 
-Install and start only after verifying the paths and ownership:
+Create the Linux account and ensure it owns the project directory, `.env`, and the configured `DATA_DIR`. Do not leave the placeholder values in the installed unit. Then install and start:
 
 ```bash
 sudo cp usermlbot.service /etc/systemd/system/usermlbot.service
+sudo nano /etc/systemd/system/usermlbot.service
+sudo systemd-analyze verify /etc/systemd/system/usermlbot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now usermlbot
 sudo systemctl status usermlbot
 journalctl -u usermlbot -f
 ```
+
+If your venv is named `venv` instead of `.venv`, update `ExecStart` accordingly.
 
 ## Persistent files
 
