@@ -707,6 +707,12 @@ async def db_fetchone(query: str, params: tuple = ()) -> Optional[tuple]:
         return await asyncio.to_thread(_db_fetchone_sync, query, params)
 
 
+async def load_learned_digit_templates() -> dict[str, list[Any]]:
+    """Load the template cache without racing other operations on the SQLite connection."""
+    async with db_lock:
+        return await asyncio.to_thread(_load_learned_digit_templates_sync)
+
+
 async def log_caught_character(name: str, rarity: str, anime: str, group_id: int) -> None:
     await db_execute(
         """
@@ -3667,7 +3673,7 @@ def solve_by_learned_template_match(img, options: list[str]) -> Optional[tuple[s
     options = [x for x in options if len(x) == 4]
     if not options:
         return None
-    cache = _load_learned_digit_templates_sync()
+    cache = await load_learned_digit_templates()
     min_templates = int(CONFIG.get("captcha_learning_min_templates", 3))
     required_digits = set("".join(options))
     missing = [d for d in sorted(required_digits) if len(cache.get(d, [])) < min_templates]
@@ -5565,7 +5571,7 @@ async def warmup_captcha_engines() -> None:
     try:
         if captcha_cv_ready():
             await asyncio.to_thread(_get_digit_template_cache)
-            await asyncio.to_thread(_load_learned_digit_templates_sync)
+            await load_learned_digit_templates()
         if CONFIG.get("enable_easyocr", False):
             await asyncio.to_thread(_get_easyocr_reader)
         if getenv_bool("CAPTCHA_WARMUP_LOG", False):
