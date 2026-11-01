@@ -112,9 +112,11 @@ class RuntimeBehaviorTests(unittest.TestCase):
             main.conversation_tasks[-100123] = conversation
 
             try:
-                await main.shutdown_clients()
+                with self.assertLogs(level="ERROR") as captured_logs:
+                    await main.shutdown_clients()
                 await asyncio.sleep(0)
 
+                self.assertTrue(any("Failed to stop Telegram session A" in item for item in captured_logs.output))
                 self.assertTrue(all(client.stop_called for client in clients))
                 self.assertTrue(background.cancelled())
                 self.assertTrue(conversation.cancelled())
