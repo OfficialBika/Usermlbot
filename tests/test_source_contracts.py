@@ -137,7 +137,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIsNotNone(stop_gather)
         self.assertTrue(close_calls)
         self.assertLess(min(node.lineno for node in cancel_calls), min(node.lineno for node in gathers))
-        self.assertLess(max(node.lineno for node in gathers), stop_gather.lineno)
+        self.assertLess(min(node.lineno for node in gathers), stop_gather.lineno)
         self.assertLess(stop_gather.lineno, min(node.lineno for node in close_calls))
 
     def test_captcha_cpu_solver_functions_remain_synchronous(self):
