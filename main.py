@@ -110,6 +110,7 @@ CONFIG: dict[str, Any] = {}
 # Human chat loop state
 enabled_groups: Set[int] = set()
 conversation_tasks: dict[int, asyncio.Task] = {}
+background_tasks: set[asyncio.Task] = set()
 
 # Owner mention duplicate protection
 alert_seen: dict[Tuple[int, int], float] = {}
@@ -162,6 +163,50 @@ async def run_cpu_solver(func, *args, timeout: Optional[float] = None):
         if timeout and timeout > 0:
             return await asyncio.wait_for(coro, timeout=timeout)
         return await coro
+
+
+def spawn_background_task(coro, *, name: Optional[str] = None) -> asyncio.Task:
+    """Create a tracked task so shutdown can cancel and await it before closing resources."""
+    task = asyncio.create_task(coro, name=name)
+    background_tasks.add(task)
+
+    def _on_done(done: asyncio.Task) -> None:
+        background_tasks.discard(done)
+        if done.cancelled():
+            return
+        try:
+            error = done.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logging.error(
+                "Background task %s failed: %s",
+                done.get_name(),
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def _await_thread_completion(func, *args):
+    """Keep a worker thread's operation alive until it finishes, even if caller is cancelled."""
+    worker = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        except Exception:
+            logging.exception("Worker thread failed while waiting for cancellation")
+        raise
+
+
+async def _run_db_locked(func, *args):
+    """Serialize SQLite operations and do not release the lock while a cancelled worker is running."""
+    async with db_lock:
+        return await _await_thread_completion(func, *args)
 
 # Direct MongoDB catch system
 direct_mongo_client = None
@@ -611,10 +656,12 @@ def load_lines(path: str) -> List[str]:
 def init_database() -> None:
     global db_conn
 
-    db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    cursor = db_conn.cursor()
+    connection = sqlite3.connect(DB_FILE, check_same_thread=False)
+    db_conn = connection
+    try:
+        cursor = connection.cursor()
 
-    cursor.execute("""
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS caught_characters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             catch_date TEXT,
@@ -662,7 +709,13 @@ def init_database() -> None:
         )
     """)
 
-    db_conn.commit()
+        connection.commit()
+    except Exception:
+        try:
+            connection.close()
+        finally:
+            db_conn = None
+        raise
 
 
 def _db_execute_sync(query: str, params: tuple = ()) -> None:
@@ -693,24 +746,20 @@ def _db_fetchone_sync(query: str, params: tuple = ()) -> Optional[tuple]:
 
 
 async def db_execute(query: str, params: tuple = ()) -> None:
-    async with db_lock:
-        await asyncio.to_thread(_db_execute_sync, query, params)
+    await _run_db_locked(_db_execute_sync, query, params)
 
 
 async def db_fetchall(query: str, params: tuple = ()) -> list[tuple]:
-    async with db_lock:
-        return await asyncio.to_thread(_db_fetchall_sync, query, params)
+    return await _run_db_locked(_db_fetchall_sync, query, params)
 
 
 async def db_fetchone(query: str, params: tuple = ()) -> Optional[tuple]:
-    async with db_lock:
-        return await asyncio.to_thread(_db_fetchone_sync, query, params)
+    return await _run_db_locked(_db_fetchone_sync, query, params)
 
 
 async def load_learned_digit_templates() -> dict[str, list[Any]]:
     """Load the template cache without racing other operations on the SQLite connection."""
-    async with db_lock:
-        return await asyncio.to_thread(_load_learned_digit_templates_sync)
+    return await _run_db_locked(_load_learned_digit_templates_sync)
 
 
 async def log_caught_character(name: str, rarity: str, anime: str, group_id: int) -> None:
@@ -2286,7 +2335,7 @@ async def handle_direct_db_catch(
         )
 
         if CONFIG.get("direct_db_delete_catch_command", CONFIG.get("auto_delete_catch_command", True)):
-            asyncio.create_task(
+            spawn_background_task(
                 delete_later(
                     app,
                     m.chat.id,
@@ -2657,8 +2706,8 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
             )
 
             if CONFIG.get("auto_delete_catch_command", True):
-                asyncio.create_task(
-                    delete_later(
+                spawn_background_task(
+                    delete_later,
                         app,
                         pending["original_chat_id"],
                         sent_message.id,
@@ -3580,16 +3629,15 @@ async def _save_captcha_templates(
     message_id: int,
     limit: int,
 ) -> bool:
-    async with db_lock:
-        return await asyncio.to_thread(
-            _save_captcha_templates_sync,
-            answer,
-            crops,
-            session_key,
-            chat_id,
-            message_id,
-            limit,
-        )
+    return await _run_db_locked(
+        _save_captcha_templates_sync,
+        answer,
+        crops,
+        session_key,
+        chat_id,
+        message_id,
+        limit,
+    )
 
 
 def _extract_four_digit_crops_for_learning(img) -> Optional[list[Any]]:
@@ -5615,7 +5663,10 @@ async def handle_general_message(app: Client, session_key: str, m) -> None:
         if CONFIG.get("captcha_solver_enabled") and session_key in CONFIG.get("captcha_solver_sessions", {"a"}):
             try:
                 if looks_like_captcha_message(m):
-                    asyncio.create_task(handle_captcha_solver(app, session_key, m))
+                    spawn_background_task(
+                        handle_captcha_solver(app, session_key, m),
+                        name=f"captcha-solver-{session_key}-{m.chat.id}-{m.id}",
+                    )
             except Exception as e:
                 logging.warning("captcha background schedule failed: %s", e)
 
@@ -5674,11 +5725,17 @@ def register_handlers() -> None:
 
 
 async def shutdown_clients() -> None:
+    global db_conn, direct_mongo_client, direct_items_collection
+
     for gid in list(enabled_groups):
         enabled_groups.discard(gid)
 
-    tasks = [task for task in conversation_tasks.values() if task and not task.done()]
-
+    tasks = {
+        task
+        for task in [*background_tasks, *conversation_tasks.values()]
+        if task is not None and not task.done()
+    }
+    background_tasks.clear()
     conversation_tasks.clear()
 
     for task in tasks:
@@ -5687,23 +5744,41 @@ async def shutdown_clients() -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    if app_a is not None:
-        await app_a.stop()
+    async def _stop_client(client: Optional[Client], label: str) -> None:
+        if client is None or not getattr(client, "is_connected", False):
+            return
+        try:
+            await client.stop()
+        except Exception:
+            logging.exception("Failed to stop Telegram session %s", label)
 
-    if app_b is not None:
-        await app_b.stop()
+    await asyncio.gather(
+        _stop_client(app_a, "A"),
+        _stop_client(app_b, "B"),
+        _stop_client(app_c, "C"),
+        _stop_client(app_d, "D"),
+        return_exceptions=True,
+    )
 
-    if app_c is not None:
-        await app_c.stop()
+    # All message handlers and tracked background tasks have stopped before
+    # the shared SQLite connection is closed.
+    async with db_lock:
+        connection = db_conn
+        db_conn = None
+        if connection is not None:
+            try:
+                await _await_thread_completion(connection.close)
+            except Exception:
+                logging.exception("Failed to close SQLite connection")
 
-    if app_d is not None:
-        await app_d.stop()
-
-    if db_conn is not None:
-        db_conn.close()
-
-    if direct_mongo_client is not None:
-        direct_mongo_client.close()
+    mongo_client = direct_mongo_client
+    direct_mongo_client = None
+    direct_items_collection = None
+    if mongo_client is not None:
+        try:
+            mongo_client.close()
+        except Exception:
+            logging.exception("Failed to close Direct DB Mongo client")
 
 
 async def send_startup_summary() -> None:
@@ -5777,106 +5852,109 @@ async def main() -> None:
     CONFIG = load_config()
     setup_logging(CONFIG["debug"])
 
-    init_database()
-    init_auto_config()
-
-    sessa_lines = load_lines(SESSA_FILE)
-    sessb_lines = load_lines(SESSB_FILE)
-    sessc_lines = load_lines(SESSC_FILE)
-    sessd_lines = load_lines(SESSD_FILE)
-
-    if not sessa_lines:
-        logging.warning("locales/sessa.txt is empty or missing")
-
-    if not sessb_lines:
-        logging.warning("locales/sessb.txt is empty or missing")
-
-    if CONFIG.get("session_c_string") and not sessc_lines:
-        logging.warning("locales/sessc.txt is empty or missing; session C will use emojis")
-
-    if CONFIG.get("session_d_string") and not sessd_lines:
-        logging.warning("locales/sessd.txt is empty or missing; session D will use emojis")
-
-    app_a = Client(
-        "session_a",
-        api_id=CONFIG["api_id"],
-        api_hash=CONFIG["api_hash"],
-        session_string=CONFIG["session_a_string"],
-        in_memory=True,
-    )
-
-    app_b = Client(
-        "session_b",
-        api_id=CONFIG["api_id"],
-        api_hash=CONFIG["api_hash"],
-        session_string=CONFIG["session_b_string"],
-        in_memory=True,
-    )
-
-    if CONFIG.get("session_c_string"):
-        app_c = Client(
-            "session_c",
-            api_id=CONFIG["api_id"],
-            api_hash=CONFIG["api_hash"],
-            session_string=CONFIG["session_c_string"],
-            in_memory=True,
-        )
-
-    if CONFIG.get("session_d_string"):
-        app_d = Client(
-            "session_d",
-            api_id=CONFIG["api_id"],
-            api_hash=CONFIG["api_hash"],
-            session_string=CONFIG["session_d_string"],
-            in_memory=True,
-        )
-
-    await app_a.start()
-    await app_b.start()
-    if app_c is not None:
-        await app_c.start()
-    if app_d is not None:
-        await app_d.start()
-
-    await ensure_ids()
-    register_handlers()
-
-    start_active_timer()
-
-    # Warm up Pyrogram peer cache so LOG_GROUP_ID works with in_memory string sessions.
-    await warmup_peer_cache(app_a)
-
-    await init_direct_db()
-
-    logging.warning(
-        "Started successfully | session_a_id=%s | session_b_id=%s | session_c_id=%s | session_d_id=%s | groups=%s | auto_forward=%s | human_chat_sessions=%s | auto_catch_sessions=%s",
-        session_a_id,
-        session_b_id,
-        session_c_id,
-        session_d_id,
-        format_id_list(CONFIG["group_ids"]),
-        CONFIG.get("auto_forward_enabled"),
-        ",".join(sorted(CONFIG.get("human_chat_sessions", []))),
-        ",".join(sorted(CONFIG.get("auto_catch_sessions", []))),
-    )
-
-    await send_startup_summary()
-
-    captcha_cleanup_task = asyncio.create_task(captcha_cleanup_loop())
-    captcha_warmup_task = asyncio.create_task(warmup_captcha_engines())
-
     health_server = None
     try:
+        # Put every resource acquisition inside this lifecycle boundary. Any
+        # failure during DB init, Telegram startup, handler setup, Mongo init,
+        # notifications, or HTTP startup will now execute the same cleanup.
+        init_database()
+        init_auto_config()
+
+        sessa_lines = load_lines(SESSA_FILE)
+        sessb_lines = load_lines(SESSB_FILE)
+        sessc_lines = load_lines(SESSC_FILE)
+        sessd_lines = load_lines(SESSD_FILE)
+
+        if not sessa_lines:
+            logging.warning("locales/sessa.txt is empty or missing")
+
+        if not sessb_lines:
+            logging.warning("locales/sessb.txt is empty or missing")
+
+        if CONFIG.get("session_c_string") and not sessc_lines:
+            logging.warning("locales/sessc.txt is empty or missing; session C will use emojis")
+
+        if CONFIG.get("session_d_string") and not sessd_lines:
+            logging.warning("locales/sessd.txt is empty or missing; session D will use emojis")
+
+        app_a = Client(
+            "session_a",
+            api_id=CONFIG["api_id"],
+            api_hash=CONFIG["api_hash"],
+            session_string=CONFIG["session_a_string"],
+            in_memory=True,
+        )
+
+        app_b = Client(
+            "session_b",
+            api_id=CONFIG["api_id"],
+            api_hash=CONFIG["api_hash"],
+            session_string=CONFIG["session_b_string"],
+            in_memory=True,
+        )
+
+        if CONFIG.get("session_c_string"):
+            app_c = Client(
+                "session_c",
+                api_id=CONFIG["api_id"],
+                api_hash=CONFIG["api_hash"],
+                session_string=CONFIG["session_c_string"],
+                in_memory=True,
+            )
+
+        if CONFIG.get("session_d_string"):
+            app_d = Client(
+                "session_d",
+                api_id=CONFIG["api_id"],
+                api_hash=CONFIG["api_hash"],
+                session_string=CONFIG["session_d_string"],
+                in_memory=True,
+            )
+
+        await app_a.start()
+        await app_b.start()
+        if app_c is not None:
+            await app_c.start()
+        if app_d is not None:
+            await app_d.start()
+
+        await ensure_ids()
+        register_handlers()
+
+        start_active_timer()
+
+        # Warm up Pyrogram peer cache so LOG_GROUP_ID works with in_memory string sessions.
+        await warmup_peer_cache(app_a)
+
+        await init_direct_db()
+
+        logging.warning(
+            "Started successfully | session_a_id=%s | session_b_id=%s | session_c_id=%s | session_d_id=%s | groups=%s | auto_forward=%s | human_chat_sessions=%s | auto_catch_sessions=%s",
+            session_a_id,
+            session_b_id,
+            session_c_id,
+            session_d_id,
+            format_id_list(CONFIG["group_ids"]),
+            CONFIG.get("auto_forward_enabled"),
+            ",".join(sorted(CONFIG.get("human_chat_sessions", []))),
+            ",".join(sorted(CONFIG.get("auto_catch_sessions", []))),
+        )
+
+        await send_startup_summary()
+
+        spawn_background_task(captcha_cleanup_loop(), name="captcha-cleanup")
+        spawn_background_task(warmup_captcha_engines(), name="captcha-warmup")
+
         health_server = await start_health_server()
         await idle()
     finally:
         if health_server is not None:
-            await health_server.cleanup()
+            try:
+                await health_server.cleanup()
+            except Exception:
+                logging.exception("Failed to stop health server")
+
         stop_active_timer()
-        if 'captcha_cleanup_task' in locals() and captcha_cleanup_task and not captcha_cleanup_task.done():
-            captcha_cleanup_task.cancel()
-        if 'captcha_warmup_task' in locals() and captcha_warmup_task and not captcha_warmup_task.done():
-            captcha_warmup_task.cancel()
         await shutdown_clients()
 
 
