@@ -13,7 +13,6 @@ from io import BytesIO
 from typing import Any, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
-from aiohttp import web
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
@@ -5856,32 +5855,6 @@ async def send_startup_summary() -> None:
     )
 
 
-async def health_check(_request):
-    """Render health endpoint; return healthy only after bot startup."""
-    if app_a is None or app_b is None:
-        return web.json_response({"status": "starting"}, status=503)
-    if not getattr(app_a, "is_connected", False) or not getattr(app_b, "is_connected", False):
-        return web.json_response({"status": "unavailable"}, status=503)
-    return web.json_response({"status": "ok"})
-
-
-async def start_health_server():
-    """Start the optional HTTP health endpoint for Render and local probes."""
-    host = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port = int(os.getenv("PORT", "10000"))
-    application = web.Application()
-    application.router.add_get("/health", health_check)
-    runner = web.AppRunner(application)
-    await runner.setup()
-    try:
-        site = web.TCPSite(runner, host, port)
-        await site.start()
-    except Exception:
-        await runner.cleanup()
-        raise
-    logging.info("Health server listening on %s:%s", host, port)
-    return runner
-
 
 async def main() -> None:
     global CONFIG, app_a, app_b, app_c, app_d, sessa_lines, sessb_lines, sessc_lines, sessd_lines
@@ -5889,7 +5862,6 @@ async def main() -> None:
     CONFIG = load_config()
     setup_logging(CONFIG["debug"])
 
-    health_server = None
     try:
         # Put every resource acquisition inside this lifecycle boundary. Any
         # failure during DB init, Telegram startup, handler setup, Mongo init,
@@ -5982,18 +5954,8 @@ async def main() -> None:
         spawn_background_task(captcha_cleanup_loop(), name="captcha-cleanup")
         spawn_background_task(warmup_captcha_engines(), name="captcha-warmup")
 
-        if getenv_bool("ENABLE_HEALTH_SERVER", False):
-            health_server = await start_health_server()
-        else:
-            logging.info("HTTP health server disabled (ENABLE_HEALTH_SERVER=false)")
         await idle()
     finally:
-        if health_server is not None:
-            try:
-                await health_server.cleanup()
-            except Exception:
-                logging.exception("Failed to stop health server")
-
         stop_active_timer()
         await shutdown_clients()
 
