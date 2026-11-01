@@ -1,21 +1,22 @@
 [Unit]
-Description=Usermlbot Pyrogram Service
+Description=Usermlbot Telegram Userbot
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-
-# Replace these placeholders with the actual VPS account and project paths.
-User=REPLACE_WITH_LINUX_USER
-Group=REPLACE_WITH_LINUX_GROUP
-WorkingDirectory=/REPLACE/WITH/PROJECT/PATH
-EnvironmentFile=/REPLACE/WITH/PROJECT/PATH/.env
-ExecStart=/REPLACE/WITH/PROJECT/PATH/.venv/bin/python -u /REPLACE/WITH/PROJECT/PATH/main.py
+User=bika
+Group=bika
+WorkingDirectory=/home/bika/Usermlbot
+EnvironmentFile=/home/bika/Usermlbot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/bika/Usermlbot/.venv/bin/python -u /home/bika/Usermlbot/main.py
 
 Restart=on-failure
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStartSec=180
+TimeoutStopSec=60
 KillSignal=SIGTERM
 UMask=027
 NoNewPrivileges=true
