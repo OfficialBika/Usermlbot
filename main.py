@@ -4097,7 +4097,11 @@ def solve_by_quadrant_option_match(img, options: list[str]) -> Optional[tuple[st
     return answer, confidence, method
 
 
-def get_captcha_best_guess(img, options: list[str]) -> Optional[tuple[str, float, str, str]]:
+def get_captcha_best_guess(
+    img,
+    options: list[str],
+    learned_result: Optional[tuple[str, float, str]] = None,
+) -> Optional[tuple[str, float, str, str]]:
     """Return best guess + confidence + method + ranked candidates, even if too weak for auto-click."""
     if not captcha_cv_ready() or img is None:
         return None
@@ -4111,12 +4115,8 @@ def get_captcha_best_guess(img, options: list[str]) -> Optional[tuple[str, float
         if answer in options:
             candidates.append((answer, min(0.99, max(0.85, conf)), "plain_image_marker"))
 
-    try:
-        learned = await solve_by_learned_template_match(img, options)
-        if learned:
-            candidates.append(learned)
-    except Exception:
-        pass
+    if learned_result:
+        candidates.append(learned_result)
 
     try:
         visual = solve_by_visual_option_match(img, options)
@@ -4169,7 +4169,11 @@ def get_captcha_best_guess(img, options: list[str]) -> Optional[tuple[str, float
 
 
 
-def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, float, str]]:
+def solve_captcha_image_auto(
+    img,
+    options: list[str],
+    learned_result: Optional[tuple[str, float, str]] = None,
+) -> Optional[tuple[str, float, str]]:
     options = [normalize_option(x) for x in options]
 
     # 1) Best possible if your own captcha generator embeds an answer marker.
@@ -4181,11 +4185,6 @@ def solve_captcha_image_auto(img, options: list[str]) -> Optional[tuple[str, flo
 
     # 2) Learned local template matcher. This becomes the most accurate method after
     # you correct/train several captchas with /captcha_answer 1234.
-    try:
-        learned_result = await solve_by_learned_template_match(img, options)
-    except Exception as e:
-        logging.warning("learned_template_match failed: %s", e)
-        learned_result = None
     if learned_result:
         return learned_result
 
@@ -4813,7 +4812,15 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
 
     solver_timeout = getenv_float("CAPTCHA_SOLVER_TIMEOUT_SECONDS", 18.0)
     try:
-        result = await run_cpu_solver(solve_captcha_image_auto, img, options, timeout=solver_timeout)
+        learned_result = await solve_by_learned_template_match(img, options)
+    except Exception as e:
+        logging.warning("learned_template_match failed: %s", e)
+        learned_result = None
+
+    try:
+        result = await run_cpu_solver(
+            solve_captcha_image_auto, img, options, learned_result, timeout=solver_timeout
+        )
     except asyncio.TimeoutError:
         await send_log(
             "🧩 <b>Captcha solver timeout.</b>\n"
@@ -4844,7 +4851,13 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
 
     if not result:
         try:
-            best_guess = await run_cpu_solver(get_captcha_best_guess, img, options, timeout=getenv_float("CAPTCHA_BEST_GUESS_TIMEOUT_SECONDS", 8.0))
+            best_guess = await run_cpu_solver(
+                get_captcha_best_guess,
+                img,
+                options,
+                learned_result,
+                timeout=getenv_float("CAPTCHA_BEST_GUESS_TIMEOUT_SECONDS", 8.0),
+            )
         except asyncio.TimeoutError:
             best_guess = None
         except Exception as e:
@@ -4903,7 +4916,13 @@ async def handle_captcha_solver(app: Client, session_key: str, m) -> None:
     min_conf = CONFIG.get("captcha_min_confidence", 0.60)
     if confidence < min_conf:
         try:
-            best_guess = await run_cpu_solver(get_captcha_best_guess, img, options, timeout=getenv_float("CAPTCHA_BEST_GUESS_TIMEOUT_SECONDS", 8.0))
+            best_guess = await run_cpu_solver(
+                get_captcha_best_guess,
+                img,
+                options,
+                learned_result,
+                timeout=getenv_float("CAPTCHA_BEST_GUESS_TIMEOUT_SECONDS", 8.0),
+            )
         except asyncio.TimeoutError:
             best_guess = None
         except Exception as e:
