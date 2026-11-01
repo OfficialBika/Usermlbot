@@ -2722,12 +2722,13 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
             if CONFIG.get("auto_delete_catch_command", True):
                 spawn_background_task(
-                    delete_later,
+                    delete_later(
                         app,
                         pending["original_chat_id"],
                         sent_message.id,
                         CONFIG.get("catch_delete_after_seconds", 1.0),
-                    )
+                    ),
+                    name=f"delete-catch-command-{session_key}-{sent_message.id}",
                 )
 
         except FloodWait as e:
