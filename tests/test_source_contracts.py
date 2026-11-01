@@ -220,6 +220,12 @@ class RuntimeSafetyContracts(unittest.TestCase):
         unused = sorted(key for key in keys if f'"{key}"' not in SOURCE and f"'{key}'" not in SOURCE)
         self.assertEqual(unused, [], f"Unused .env.example settings: {unused}")
 
+    def test_gitignore_protects_credentials_and_runtime_state(self):
+        ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        for pattern in (".env", "*.session", "*.db", "bot_config.json", "logs/*.log"):
+            self.assertIn(pattern, ignore)
+        self.assertIn("!.env.example", ignore)
+
     def test_optional_automation_is_disabled_in_example(self):
         for setting in (
             "AUTO_FORWARD_ENABLED=false",
