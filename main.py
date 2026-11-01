@@ -2057,9 +2057,25 @@ async def init_direct_db() -> None:
             parse_html=True,
         )
     except Exception as e:
+        failed_client = direct_mongo_client
+        direct_mongo_client = None
         direct_items_collection = None
+        direct_support_bots_collection = None
+        direct_supported_bots_by_id.clear()
+        direct_supported_bots_by_key.clear()
+        direct_supported_bots_by_username.clear()
+
+        if failed_client is not None:
+            try:
+                failed_client.close()
+            except Exception:
+                logging.exception("Failed to close Mongo client after initialization error")
+
         logging.warning("init_direct_db failed: %s", e)
-        await send_log(f"❌ Direct DB catch connect failed: <code>{html.escape(str(e))}</code>", parse_html=True)
+        await send_log(
+            f"❌ Direct DB catch connect failed: <code>{html.escape(str(e))}</code>",
+            parse_html=True,
+        )
 
 
 def get_direct_items_collection(source_profile: Optional[dict[str, Any]] = None):
