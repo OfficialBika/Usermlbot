@@ -86,6 +86,45 @@ class RuntimeBehaviorTests(unittest.TestCase):
             ["uid-small", "uid-large"],
         )
 
+    def test_auth_target_uses_replied_user_or_numeric_argument(self):
+        from types import SimpleNamespace
+
+        message = SimpleNamespace(reply_to_message=SimpleNamespace(from_user=SimpleNamespace(id=67890)))
+        self.assertEqual(main.get_auth_target_user_id(message, "/auth"), 67890)
+
+        message = SimpleNamespace(reply_to_message=None)
+        self.assertEqual(main.get_auth_target_user_id(message, "/auth 12345"), 12345)
+        self.assertIsNone(main.get_auth_target_user_id(message, "/auth"))
+        self.assertIsNone(main.get_auth_target_user_id(message, "/auth -123"))
+
+    def test_authorized_users_are_persisted_and_owner_ids_are_excluded(self):
+        import tempfile
+
+        old_authorized = set(main.AUTHORIZED_USERS)
+        old_groups = main.SOURCE_GROUPS_CONFIG
+        old_rarities = main.RARITY_CONFIG
+        old_config = main.CONFIG
+        old_path = main.BOT_CONFIG_FILE
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                main.BOT_CONFIG_FILE = os.path.join(temp_dir, "bot_config.json")
+                main.CONFIG = {"owner_ids": {111}}
+                main.SOURCE_GROUPS_CONFIG = {}
+                main.RARITY_CONFIG = {}
+                main.AUTHORIZED_USERS.clear()
+                main.AUTHORIZED_USERS.update({111, 222, 333})
+                main.save_auto_config()
+                main.AUTHORIZED_USERS.clear()
+                main.init_auto_config()
+                self.assertEqual(main.AUTHORIZED_USERS, {222, 333})
+        finally:
+            main.AUTHORIZED_USERS.clear()
+            main.AUTHORIZED_USERS.update(old_authorized)
+            main.SOURCE_GROUPS_CONFIG = old_groups
+            main.RARITY_CONFIG = old_rarities
+            main.CONFIG = old_config
+            main.BOT_CONFIG_FILE = old_path
+
     def test_cancelled_sqlite_caller_keeps_lock_until_worker_finishes(self):
         async def scenario():
             main.db_lock = asyncio.Lock()
