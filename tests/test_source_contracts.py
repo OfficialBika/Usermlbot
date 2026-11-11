@@ -270,5 +270,23 @@ class RuntimeSafetyContracts(unittest.TestCase):
             self.assertIn(setting, ENV_EXAMPLE)
 
 
+    def test_character_catcher_uses_lookup_resolver_without_direct_db_lookup(self):
+        handler = top_level_function("handle_auto_forward_spawn")
+        source = ast.unparse(handler)
+        self.assertIn('source_key == "character_catcher"', source)
+        self.assertIn("LOOKUP_RESOLVER_BOT_ID", source)
+        self.assertIn("if CONFIG.get('direct_db_catch_enabled') and not use_lookup_resolver", source)
+        self.assertIn("chat_id=target_responder_bot_id", source)
+
+    def test_lookup_resolver_dm_prefers_full_catch_command(self):
+        extractor = top_level_function("extract_catch_command")
+        source = ast.unparse(extractor)
+        full_pos = source.index("Full")
+        hint_pos = source.index("Hint")
+        self.assertLess(full_pos, hint_pos)
+        responder = top_level_function("handle_responder_dm")
+        self.assertIn("LOOKUP_RESOLVER_BOT_ID", ast.unparse(responder))
+
+
 if __name__ == "__main__":
     unittest.main()
