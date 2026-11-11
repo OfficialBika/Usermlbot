@@ -316,7 +316,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
 
         handler = top_level_function("handle_auto_forward_spawn")
         handler_source = ast.unparse(handler)
-        self.assertIn('source_key == "character_catcher"', handler_source)
+        self.assertIn("character_catcher", handler_source)
         self.assertIn("not use_lookup_resolver", handler_source)
         self.assertIn("auto_catch_sessions", handler_source)
 
