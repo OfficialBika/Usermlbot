@@ -106,6 +106,9 @@ sessd_lines: List[str] = []
 
 CONFIG: dict[str, Any] = {}
 
+# Users explicitly authorized by an owner to toggle their current group's chat loop.
+AUTHORIZED_USERS: Set[int] = set()
+
 # Human chat loop state
 enabled_groups: Set[int] = set()
 conversation_tasks: dict[int, asyncio.Task] = {}
@@ -889,7 +892,16 @@ def init_auto_config() -> None:
 
     saved = load_saved_auto_config()
 
+    AUTHORIZED_USERS.clear()
     if saved:
+        for user_id in saved.get("authorized_users", []):
+            try:
+                parsed_user_id = int(user_id)
+                if parsed_user_id > 0 and parsed_user_id not in CONFIG.get("owner_ids", set()):
+                    AUTHORIZED_USERS.add(parsed_user_id)
+            except (TypeError, ValueError):
+                continue
+
         for gid_raw, group_data in saved.get("groups", {}).items():
             try:
                 gid = int(gid_raw)
@@ -947,6 +959,7 @@ def save_auto_config() -> None:
     data = {
         "groups": SOURCE_GROUPS_CONFIG,
         "rarities": RARITY_CONFIG,
+        "authorized_users": sorted(AUTHORIZED_USERS),
     }
 
     with open(BOT_CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -5143,6 +5156,24 @@ def is_owner_message(m) -> bool:
     return m.from_user.id in CONFIG["owner_ids"]
 
 
+def is_authorized_user(m) -> bool:
+    return bool(m.from_user and int(m.from_user.id) in AUTHORIZED_USERS)
+
+
+def get_auth_target_user_id(m, command_text: str) -> Optional[int]:
+    """Resolve /auth target from a replied user or an explicit numeric user ID."""
+    reply = getattr(m, "reply_to_message", None)
+    reply_user = getattr(reply, "from_user", None) if reply else None
+    if reply_user is not None:
+        return int(reply_user.id)
+
+    parts = (command_text or "").split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        target_id = int(parts[1])
+        return target_id if target_id > 0 else None
+    return None
+
+
 def is_command_context(m) -> bool:
     if not m.chat:
         return False
@@ -5203,6 +5234,8 @@ async def send_help(m) -> None:
         "<b>Human Chat Loop:</b>\n"
         "• <code>/open</code> - current group ON\n"
         "• <code>/close</code> - current group OFF\n"
+        "• <code>/auth</code> - reply to a user or /auth USER_ID (owner only)\n"
+        "• <code>/unauth</code> - reply to a user or /unauth USER_ID (owner only)\n"
         "• <code>/status</code> - current group status\n"
         "• <code>/statusall</code> - all groups status\n"
         "• <code>HUMAN_CHAT_SESSIONS=a,b,c,d</code> - A/B/C/D chat loop\n\n"
@@ -5390,7 +5423,9 @@ async def handle_owner_command(_, m) -> None:
     global auto_forward_paused, auto_forward_error
 
     try:
-        if not is_owner_message(m):
+        is_owner = is_owner_message(m)
+        is_authorized = is_authorized_user(m)
+        if not is_owner and not is_authorized:
             return
 
         if not is_command_context(m):
@@ -5400,6 +5435,38 @@ async def handle_owner_command(_, m) -> None:
         text_lower = text.lower()
         cmd = parse_command(text)
         chat_id = m.chat.id
+
+        # Only owners can grant or revoke the limited open/close permission.
+        if cmd in {"/auth", "/unauth"}:
+            if not is_owner:
+                await m.reply("❌ Only the owner can manage permissions.")
+                return
+            target_id = get_auth_target_user_id(m, text)
+            if target_id is None:
+                await m.reply("❌ Usage: reply to a user's message with /auth or /unauth, or use /auth USER_ID /unauth USER_ID.")
+                return
+            if target_id in CONFIG.get("owner_ids", set()):
+                await m.reply("ℹ️ Owner already has full permissions; owner access cannot be changed here.")
+                return
+            if cmd == "/auth":
+                if target_id in AUTHORIZED_USERS:
+                    await m.reply(f"ℹ️ <code>{target_id}</code> is already authorized.", parse_mode=ParseMode.HTML)
+                    return
+                AUTHORIZED_USERS.add(target_id)
+                save_auto_config()
+                await m.reply(f"✅ Authorized <code>{target_id}</code>. They can now use /open and /close in allowed groups.", parse_mode=ParseMode.HTML)
+            else:
+                if target_id not in AUTHORIZED_USERS:
+                    await m.reply(f"ℹ️ <code>{target_id}</code> is not authorized.", parse_mode=ParseMode.HTML)
+                    return
+                AUTHORIZED_USERS.discard(target_id)
+                save_auto_config()
+                await m.reply(f"✅ Authorization removed for <code>{target_id}</code>.", parse_mode=ParseMode.HTML)
+            return
+
+        # Authorized users get only these two commands; every admin command stays owner-only.
+        if not is_owner and cmd not in {"/open", "/close"}:
+            return
 
         if cmd == "/open":
             if chat_id not in CONFIG["group_ids"] and chat_id not in SOURCE_GROUPS_CONFIG:
@@ -5780,7 +5847,8 @@ async def handle_edited_message(app: Client, session_key: str, m) -> None:
 
 
 def register_handlers() -> None:
-    owner_filter = filters.user(list(CONFIG["owner_ids"]))
+    # The command handler performs owner/authorized-user checks internally.
+    # This allows permission changes to take effect immediately without restart.
 
     # Broad early handlers are intentional.
     # Some bot DMs are ChatType.BOT instead of ChatType.PRIVATE, so filters.private can miss them.
@@ -5794,7 +5862,7 @@ def register_handlers() -> None:
         await handle_responder_dm(app_b, "b", m)
 
     # Owner commands can be text OR photo+caption, e.g. /captcha_answer 1351.
-    @app_a.on_message(owner_filter, group=0)
+    @app_a.on_message(group=0)
     async def commands_a(_, m):
         await handle_owner_command(_, m)
 
