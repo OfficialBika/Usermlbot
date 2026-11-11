@@ -198,4 +198,4 @@ The project directory and `DATA_DIR` must be writable by the service account. Ba
 
 ## Commands
 
-Send supported owner commands from the configured owner account in an allowed chat. Use `/help` in Telegram for the runtime command list.
+Send owner commands from the configured owner account in an allowed chat. The owner can grant or revoke the limited group-loop permission with `/auth USER_ID` and `/unauth USER_ID`, or by replying to a user's message with either command. Authorized users can only run `/open` and `/close` in allowed groups; all other administrative commands remain owner-only. Authorization is persisted in `bot_config.json` across restarts. Use `/help` in Telegram for the runtime command list.
