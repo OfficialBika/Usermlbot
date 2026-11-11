@@ -311,7 +311,8 @@ class RuntimeSafetyContracts(unittest.TestCase):
         config_source = ast.unparse(config)
         self.assertIn("AUTO_CATCH_SESSIONS", config_source)
         self.assertIn("a,b,c,d", config_source)
-        self.assertIn('{"a", "b", "c", "d"}', config_source)
+        self.assertIn("'a,b,c,d'", config_source)
+        self.assertIn("'c', 'd'", config_source)
 
         handler = top_level_function("handle_auto_forward_spawn")
         handler_source = ast.unparse(handler)
