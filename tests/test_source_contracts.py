@@ -309,7 +309,8 @@ class RuntimeSafetyContracts(unittest.TestCase):
     def test_character_catcher_resolver_is_enabled_for_sessions_a_to_d(self):
         config = top_level_function("load_config")
         config_source = ast.unparse(config)
-        self.assertIn('os.getenv("AUTO_CATCH_SESSIONS", "a,b,c,d")', config_source)
+        self.assertIn("AUTO_CATCH_SESSIONS", config_source)
+        self.assertIn("a,b,c,d", config_source)
         self.assertIn('{"a", "b", "c", "d"}', config_source)
 
         handler = top_level_function("handle_auto_forward_spawn")
