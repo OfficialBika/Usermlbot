@@ -200,6 +200,30 @@ class RuntimeSafetyContracts(unittest.TestCase):
             for node in ast.walk(function)
         ))
 
+    def test_mongodb_access_is_read_only_and_runtime_auth_is_local(self):
+        forbidden_mongo_methods = {
+            "insert_one", "insert_many", "update_one", "update_many",
+            "replace_one", "delete_one", "delete_many", "bulk_write",
+            "create_index", "drop_index", "drop", "rename",
+            "find_one_and_update", "find_one_and_replace", "find_one_and_delete",
+        }
+        used_methods = {
+            node.func.attr
+            for node in ast.walk(TREE)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertFalse(forbidden_mongo_methods & used_methods)
+
+        save_config = top_level_function("save_auto_config")
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "open"
+            for node in ast.walk(save_config)
+        ))
+        self.assertIn('os.getenv("BOT_CONFIG_FILE", "bot_config.json")', SOURCE)
+        self.assertIn("DATA_DIR", SOURCE)
+
     def test_vps_runtime_does_not_open_an_http_listener(self):
         self.assertNotIn("aiohttp", SOURCE)
         self.assertNotIn("start_health_server", SOURCE)
