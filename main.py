@@ -1087,13 +1087,10 @@ def clean_catch_command(cmd: str) -> str:
 
 def extract_catch_command(response_text: str) -> Optional[str]:
     """
-    Robustly extract catch command from responder bot reply.
-    Supports:
-      ❤️ Hint: /catch Douma
-      Hint : /catch Douma
-      Hint：/catch Douma
-      Full: /catch Name [Extra]
-      Any fallback /catch line
+    Extract a complete /catch command from a resolver reply.
+
+    Prefer Full when present, otherwise use Hint, then a standalone command
+    line. A bare "/catch" is never valid because it has no character name.
     """
     text = strip_invisible(response_text or "")
     if not text:
@@ -1105,20 +1102,39 @@ def extract_catch_command(response_text: str) -> Optional[str]:
         .replace("꞉", ":")
         .replace("ꓽ", ":")
     )
+    lines = text.splitlines()
 
-    patterns = [
-        # Prefer the exact Full command (including rarity/emoji suffix) over Hint.
-        r"(?:^|\\n)[^\\n]{0,60}?Full\\s*:\\s*(/catch[^\\n\\r]+)",
-        r"(?:^|\\n)[^\\n]{0,60}?Hint\\s*:\\s*(/catch[^\\n\\r]+)",
-        r"(/catch[^\\n\\r]+)",
-    ]
+    def command_from_line(line: str) -> Optional[str]:
+        match = re.search(r"(/catch(?:@\\w+)?\\s+\\S.*)", line, flags=re.IGNORECASE)
+        if not match:
+            return None
+        command = clean_catch_command(match.group(1))
+        if not re.match(r"^/catch(?:@\\w+)?\\s+\\S", command, flags=re.IGNORECASE):
+            return None
+        return command
 
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            cmd = clean_catch_command(match.group(1))
-            if cmd:
-                return cmd
+    # Search all Full-labelled lines first, then Hint-labelled lines. This
+    # keeps Full's suffix when available while allowing Hint-only resolver replies.
+    for label in ("Full", "Hint"):
+        for index, line in enumerate(lines):
+            label_match = re.search(rf"\\b{label}\\s*:\\s*(.*)", line, flags=re.IGNORECASE)
+            if not label_match:
+                continue
+            command = command_from_line(label_match.group(1))
+            if command:
+                return command
+            # Some resolver layouts put the command on the line immediately below
+            # its Full/Hint label.
+            if index + 1 < len(lines):
+                command = command_from_line(lines[index + 1])
+                if command:
+                    return command
+
+    # Last-resort compatibility for replies containing only a /catch command.
+    for line in lines:
+        command = command_from_line(line)
+        if command:
+            return command
     return None
 
 

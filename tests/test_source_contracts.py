@@ -279,10 +279,29 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("target_responder_bot_id", source)
 
     def test_lookup_resolver_dm_prefers_full_catch_command(self):
-        patterns_start = SOURCE.index("    patterns = [", SOURCE.index("def extract_catch_command("))
-        full_pos = SOURCE.index("Full", patterns_start)
-        hint_pos = SOURCE.index("Hint", patterns_start)
-        self.assertLess(full_pos, hint_pos)
+        parser_functions = [
+            top_level_function("strip_invisible"),
+            top_level_function("clean_catch_command"),
+            top_level_function("extract_catch_command"),
+        ]
+        parser_module = ast.fix_missing_locations(ast.Module(body=parser_functions, type_ignores=[]))
+        namespace = {"re": re, "unicodedata": __import__("unicodedata")}
+        exec(compile(parser_module, "<catch-parser-tests>", "exec"), namespace)
+        extract = namespace["extract_catch_command"]
+
+        self.assertEqual(
+            extract("🔸 Full : /catch Ganyu [🪶]\n🔸 Hint : /catch Ganyu"),
+            "/catch Ganyu [🪶]",
+        )
+        self.assertEqual(extract("❤️ Hint： /catch Douma"), "/catch Douma")
+        self.assertEqual(extract("Hint:\n/catch Nezuko"), "/catch Nezuko")
+        self.assertEqual(extract("Hint: /catch"), None)
+        self.assertEqual(extract("Full: /catch\nHint: /catch"), None)
+        self.assertEqual(
+            extract("Some text\n/catch Tanjiro\nPowered by resolver"),
+            "/catch Tanjiro",
+        )
+
         responder = top_level_function("handle_responder_dm")
         self.assertIn("LOOKUP_RESOLVER_BOT_ID", ast.unparse(responder))
 
