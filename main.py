@@ -67,6 +67,9 @@ DB_FILE = os.path.join(
 
 DEFAULT_OWNER_TAG = "@Bikasec"
 
+# Dedicated resolver for Character_Catcher_Bot spawns.
+LOOKUP_RESOLVER_BOT_ID = 8552029570
+
 EMOJIS = ["🙂", "😄", "😉", "😎", "🔥", "✨", "😂", "🥰"]
 
 TRIGGER_EMOJIS = [
@@ -1104,9 +1107,10 @@ def extract_catch_command(response_text: str) -> Optional[str]:
     )
 
     patterns = [
-        r"(?:^|\n)[^\n]{0,60}?Hint\s*:\s*(/catch[^\n\r]+)",
-        r"(?:^|\n)[^\n]{0,60}?Full\s*:\s*(/catch[^\n\r]+)",
-        r"(/catch[^\n\r]+)",
+        # Prefer the exact Full command (including rarity/emoji suffix) over Hint.
+        r"(?:^|\\n)[^\\n]{0,60}?Full\\s*:\\s*(/catch[^\\n\\r]+)",
+        r"(?:^|\\n)[^\\n]{0,60}?Hint\\s*:\\s*(/catch[^\\n\\r]+)",
+        r"(/catch[^\\n\\r]+)",
     ]
 
     for pattern in patterns:
@@ -2620,19 +2624,25 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
         )
         return
 
-    if CONFIG.get("direct_db_catch_enabled"):
+    # Character_Catcher_Bot uses the dedicated Bika Waifu Cheat resolver.
+    # It intentionally bypasses direct MongoDB character lookup entirely.
+    source_key = str((source_profile or {}).get("source_bot_key") or "").strip().lower()
+    use_lookup_resolver = source_key == "character_catcher"
+
+    if CONFIG.get("direct_db_catch_enabled") and not use_lookup_resolver:
         direct_sent = await handle_direct_db_catch(app, session_key, m, rarity, group_name, source_profile)
         if direct_sent:
             return
         if not CONFIG.get("direct_db_fallback_to_responder", False):
             return
 
-    if not responder_bot_id:
+    target_responder_bot_id = LOOKUP_RESOLVER_BOT_ID if use_lookup_resolver else responder_bot_id
+    if not target_responder_bot_id:
         return
 
     try:
         forwarded = await app.forward_messages(
-            chat_id=responder_bot_id,
+            chat_id=target_responder_bot_id,
             from_chat_id=chat_id,
             message_ids=m.id,
         )
@@ -2718,6 +2728,7 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
 
         sender_id = m.from_user.id if m.from_user else None
         responder_ids = set(CONFIG.get("responder_bot_ids") or set())
+        responder_ids.add(LOOKUP_RESOLVER_BOT_ID)
         responder_bot_id = CONFIG.get("responder_bot_id")
         if responder_bot_id:
             responder_ids.add(int(responder_bot_id))
