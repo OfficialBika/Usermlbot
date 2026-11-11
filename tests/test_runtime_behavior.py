@@ -108,7 +108,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 main.BOT_CONFIG_FILE = os.path.join(temp_dir, "bot_config.json")
-                main.CONFIG = {"owner_ids": {111}}
+                main.CONFIG = {"owner_ids": {111}, "group_ids": set()}
                 main.SOURCE_GROUPS_CONFIG = {}
                 main.RARITY_CONFIG = {}
                 main.AUTHORIZED_USERS.clear()
