@@ -285,7 +285,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
             top_level_function("extract_catch_command"),
         ]
         parser_module = ast.fix_missing_locations(ast.Module(body=parser_functions, type_ignores=[]))
-        namespace = {"re": re, "unicodedata": __import__("unicodedata")}
+        namespace = {"re": re, "unicodedata": __import__("unicodedata"), "Optional": __import__("typing").Optional}
         exec(compile(parser_module, "<catch-parser-tests>", "exec"), namespace)
         extract = namespace["extract_catch_command"]
 
