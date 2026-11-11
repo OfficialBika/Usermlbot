@@ -88,6 +88,25 @@ RESPONDER_BOT_ID=123456789
 
 Alternatively, use `RESPONDER_BOT_IDS` for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
 
+#### Sharing the current Adding-Helperbot database
+
+For the current Adding-Helperbot unified schema, configure Usermlbot's own `.env` with:
+
+```env
+DIRECT_DB_CATCH_ENABLED=true
+DIRECT_DB_LAYOUT=adding_helperbot
+DIRECT_DB_NAME=the_same_DB_NAME_used_by_Adding-Helperbot
+DIRECT_DB_COLLECTION=characters
+DIRECT_DB_SUPPORT_BOTS_COLLECTION=auto
+DIRECT_DB_USE_DEFAULT_SOURCE_COLLECTIONS=true
+```
+
+Use the same MongoDB connection URI as Adding-Helperbot (either `DIRECT_DB_MONGO_URI` or Usermlbot's existing `MONGO_URI`). Do not paste credentials into chat or commit them. `DIRECT_DB_NAME` must exactly match Adding-Helperbot's live `DB_NAME`; check its local `.env` because repository examples may differ.
+
+In this layout, Usermlbot reads the shared `characters` collection and scopes every match by Adding-Helperbot's `source_key` (for example, `items_character_catcher`). It checks the full `file_unique_ids` array first, with scalar legacy UID fields as compatibility fallbacks. Keep the built-in Source Collections map enabled so sender usernames resolve to the correct source key. This mode is read-only and does not create indexes, alter documents, or migrate data.
+
+Leave `DIRECT_DB_LAYOUT=legacy` (the default) for the older per-source `items_*` collection layout.
+
 ## 3. Test manually before systemd
 
 Run from the project directory with the virtual environment active:

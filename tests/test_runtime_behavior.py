@@ -33,6 +33,59 @@ class RuntimeBehaviorTests(unittest.TestCase):
         parsed = main.parse_session_keys("a,b,c,d", "a", {"a", "b"})
         self.assertEqual(parsed, {"a", "b"})
 
+    def test_adding_helperbot_layout_scopes_unified_collection_by_source_key(self):
+        old_config = main.CONFIG
+        try:
+            main.CONFIG = {
+                "direct_db_layout": "adding_helperbot",
+                "direct_db_collection": "characters",
+                "direct_db_dedicated_collection_no_filter": True,
+            }
+            profile = {
+                "source_bot_key": "character_catcher",
+                "items_collection": "items_character_catcher",
+            }
+            self.assertEqual(
+                main.direct_db_base_filter(profile),
+                {"source_key": "items_character_catcher"},
+            )
+            self.assertEqual(
+                main.direct_db_base_filter(None),
+                {"_id": {"$exists": False}},
+            )
+        finally:
+            main.CONFIG = old_config
+
+    def test_adding_helperbot_uid_query_checks_uid_array_and_legacy_fields(self):
+        old_config = main.CONFIG
+        try:
+            main.CONFIG = {"direct_db_layout": "adding_helperbot"}
+            query = main.build_direct_db_uid_query(["uid-small", "uid-large", "uid-small"])
+            expected_uids = ["uid-small", "uid-large"]
+            self.assertEqual(query["$or"][0], {"file_unique_ids": {"$in": expected_uids}})
+            self.assertIn({"telegram_file_unique_id": {"$in": expected_uids}}, query["$or"])
+            self.assertIn({"file_unique_id": {"$in": expected_uids}}, query["$or"])
+        finally:
+            main.CONFIG = old_config
+
+    def test_media_uid_collection_includes_all_photo_sizes(self):
+        from types import SimpleNamespace
+
+        message = SimpleNamespace(
+            photo=[
+                SimpleNamespace(file_unique_id="uid-small"),
+                SimpleNamespace(file_unique_id="uid-large"),
+            ],
+            video=None,
+            animation=None,
+            document=None,
+            sticker=None,
+        )
+        self.assertEqual(
+            main.get_media_file_unique_ids(message),
+            ["uid-small", "uid-large"],
+        )
+
     def test_cancelled_sqlite_caller_keeps_lock_until_worker_finishes(self):
         async def scenario():
             main.db_lock = asyncio.Lock()

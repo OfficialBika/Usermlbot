@@ -454,6 +454,9 @@ def load_config() -> dict:
     if catch_min_delay > catch_max_delay:
         catch_min_delay, catch_max_delay = catch_max_delay, catch_min_delay
 
+    direct_db_layout = os.getenv("DIRECT_DB_LAYOUT", "legacy").strip().lower() or "legacy"
+    direct_db_collection_default = "characters" if direct_db_layout == "adding_helperbot" else "items"
+
     return {
         "api_id": int(getenv_required("API_ID")),
         "api_hash": getenv_required("API_HASH"),
@@ -526,7 +529,8 @@ def load_config() -> dict:
         "direct_db_catch_enabled": direct_db_catch_enabled,
         "direct_db_mongo_uri": os.getenv("DIRECT_DB_MONGO_URI", os.getenv("MONGO_URI", "")).strip(),
         "direct_db_name": os.getenv("DIRECT_DB_NAME", os.getenv("DB_NAME", "")).strip(),
-        "direct_db_collection": os.getenv("DIRECT_DB_COLLECTION", os.getenv("MEDIA_COLLECTION", "items")).strip() or "items",
+        "direct_db_layout": direct_db_layout,
+        "direct_db_collection": os.getenv("DIRECT_DB_COLLECTION", os.getenv("MEDIA_COLLECTION", direct_db_collection_default)).strip() or direct_db_collection_default,
         "direct_db_sessions": parse_session_keys(
             os.getenv("DIRECT_DB_CATCH_SESSIONS", os.getenv("AUTO_CATCH_SESSIONS", "a,b")),
             "a",
@@ -1826,12 +1830,22 @@ def get_direct_source_profile(m) -> Optional[dict[str, Any]]:
     return None
 
 def direct_db_base_filter(source_profile: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Build a source-specific item filter.
+    """Build a source-specific item filter for the configured Mongo layout."""
+    if CONFIG.get("direct_db_layout", "legacy") == "adding_helperbot":
+        # Adding-Helperbot stores all sources in one characters collection.
+        # source_key is the original source collection key, e.g.
+        # items_character_catcher (not the shorter source_bot_key).
+        source_key = str(
+            (source_profile or {}).get("items_collection")
+            or (source_profile or {}).get("raw", {}).get("source_key")
+            or ""
+        ).strip().lower()
+        if source_key.startswith("items_"):
+            return {"source_key": source_key}
+        # Never perform an unscoped lookup if the sender/source is unknown.
+        return {"_id": {"$exists": False}}
 
-    Old code matched one hard-coded catcher bot. This version first tries to
-    restrict matches to the support bot that actually sent the current spawn,
-    so Hallow/Catch/Yelan/etc. can each use its own command + name.
-    """
+    # Legacy layout: per-source items_* collections or source fields in items.
     if source_profile:
         # Lookup Bot keeps every source bot in its own items_* collection.
         # In that layout the collection name already identifies the bot.
@@ -1890,11 +1904,43 @@ def get_media_object_and_type(m) -> tuple[Optional[Any], Optional[str]]:
     return None, None
 
 
-def get_media_file_unique_id(m) -> Optional[str]:
+def get_media_file_unique_ids(m) -> list[str]:
+    """Collect all Telegram-native UIDs, including every photo size variant."""
     media_obj, _ = get_media_object_and_type(m)
-    if not media_obj:
-        return None
-    return getattr(media_obj, "file_unique_id", None)
+    values: list[str] = []
+    photo = getattr(m, "photo", None)
+    photo_sizes = photo if isinstance(photo, (list, tuple)) else ([photo] if photo else [])
+    for item in [*photo_sizes, media_obj]:
+        uid = str(getattr(item, "file_unique_id", "") or "").strip()
+        if uid and uid not in values:
+            values.append(uid)
+    return values
+
+
+def get_media_file_unique_id(m) -> Optional[str]:
+    values = get_media_file_unique_ids(m)
+    return values[0] if values else None
+
+
+def build_direct_db_uid_query(uids: list[str]) -> dict[str, Any]:
+    """Build the exact Telegram UID query for the selected Mongo schema."""
+    clean_uids = list(dict.fromkeys(str(uid).strip() for uid in uids if str(uid).strip()))
+    if not clean_uids:
+        return {}
+    if CONFIG.get("direct_db_layout", "legacy") == "adding_helperbot":
+        # Current schema stores the UID array and a canonical scalar. Keep
+        # imported/older scalar fields as compatibility fallbacks.
+        return {
+            "$or": [
+                {"file_unique_ids": {"$in": clean_uids}},
+                {"telegram_file_unique_id": {"$in": clean_uids}},
+                {"file_unique_id": {"$in": clean_uids}},
+                {"photo_file_unique_id": {"$in": clean_uids}},
+                {"video_file_unique_id": {"$in": clean_uids}},
+                {"media.file_unique_id": {"$in": clean_uids}},
+            ]
+        }
+    return {"file_unique_id": clean_uids[0]}
 
 
 async def download_media_bytes(app: Client, m) -> Optional[bytes]:
@@ -2069,6 +2115,7 @@ async def init_direct_db() -> None:
             "✅ <b>Direct DB catch connected</b>\n"
             f"DB: <code>{html.escape(db_name)}</code>\n"
             f"Items collection: <code>{html.escape(collection_name)}</code>\n"
+            f"Schema: <code>{html.escape(str(CONFIG.get('direct_db_layout', 'legacy')))}</code>\n"
             f"Support bots collection: <code>{html.escape(str(CONFIG.get('direct_db_support_bots_collection', 'support_bots')))}</code>\n"
             f"Support bots loaded: <code>{direct_support_bot_count()}</code>\n"
             f"By bot ID: <code>{len(direct_supported_bots_by_id)}</code> | By username: <code>{len(direct_supported_bots_by_username)}</code>\n"
@@ -2107,9 +2154,12 @@ def get_direct_items_collection(source_profile: Optional[dict[str, Any]] = None)
     if not db_name:
         return direct_items_collection
 
-    collection_name = str((source_profile or {}).get("items_collection") or "").strip()
-    if not collection_name:
-        collection_name = str(CONFIG.get("direct_db_collection", "items") or "items").strip()
+    if CONFIG.get("direct_db_layout", "legacy") == "adding_helperbot":
+        collection_name = str(CONFIG.get("direct_db_collection", "characters") or "characters").strip()
+    else:
+        collection_name = str((source_profile or {}).get("items_collection") or "").strip()
+        if not collection_name:
+            collection_name = str(CONFIG.get("direct_db_collection", "items") or "items").strip()
 
     return direct_mongo_client[db_name][collection_name]
 
@@ -2133,6 +2183,9 @@ async def direct_db_find_item(app: Client, m, source_profile: Optional[dict[str,
         "user_id": 1,
         "media_type": 1,
         "file_unique_id": 1,
+        "file_unique_ids": 1,
+        "telegram_file_unique_id": 1,
+        "source_key": 1,
         "sha256": 1,
         "phash": 1,
         "frame_hashes": 1,
@@ -2140,14 +2193,16 @@ async def direct_db_find_item(app: Client, m, source_profile: Optional[dict[str,
         "anime_name": 1,
     }
 
-    file_unique_id = get_media_file_unique_id(m)
-    if CONFIG.get("direct_db_use_file_unique_id", True) and file_unique_id:
+    file_unique_ids = get_media_file_unique_ids(m)
+    if CONFIG.get("direct_db_use_file_unique_id", True) and file_unique_ids:
+        uid_query = build_direct_db_uid_query(file_unique_ids)
         doc = await items_collection.find_one(
-            {"$and": [base_filter, {"file_unique_id": file_unique_id}]},
+            {"$and": [base_filter, uid_query]},
             projection,
         )
         if doc:
-            return doc, "file_unique_id"
+            method = "file_unique_ids" if CONFIG.get("direct_db_layout") == "adding_helperbot" else "file_unique_id"
+            return doc, method
 
     raw = None
     if CONFIG.get("direct_db_use_sha256", True) or CONFIG.get("direct_db_use_phash", False):
