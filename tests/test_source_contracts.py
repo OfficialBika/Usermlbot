@@ -287,5 +287,26 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("LOOKUP_RESOLVER_BOT_ID", ast.unparse(responder))
 
 
+    def test_character_catcher_resolver_is_enabled_for_sessions_a_to_d(self):
+        config = top_level_function("load_config")
+        config_source = ast.unparse(config)
+        self.assertIn('os.getenv("AUTO_CATCH_SESSIONS", "a,b,c,d")', config_source)
+        self.assertIn('{"a", "b", "c", "d"}', config_source)
+
+        handler = top_level_function("handle_auto_forward_spawn")
+        handler_source = ast.unparse(handler)
+        self.assertIn('source_key == "character_catcher"', handler_source)
+        self.assertIn("not use_lookup_resolver", handler_source)
+        self.assertIn("auto_catch_sessions", handler_source)
+
+    def test_optional_sessions_c_and_d_register_resolver_and_group_handlers(self):
+        register = top_level_function("register_handlers")
+        source = ast.unparse(register)
+        for session in ("c", "d"):
+            self.assertIn(f"responder_dm_{session}", source)
+            self.assertIn(f"general_{session}", source)
+            self.assertIn(f'app_{session} is not None', source)
+
+
 if __name__ == "__main__":
     unittest.main()
