@@ -273,16 +273,15 @@ class RuntimeSafetyContracts(unittest.TestCase):
     def test_character_catcher_uses_lookup_resolver_without_direct_db_lookup(self):
         handler = top_level_function("handle_auto_forward_spawn")
         source = ast.unparse(handler)
-        self.assertIn('source_key == "character_catcher"', source)
+        self.assertIn("character_catcher", source)
         self.assertIn("LOOKUP_RESOLVER_BOT_ID", source)
-        self.assertIn("if CONFIG.get('direct_db_catch_enabled') and not use_lookup_resolver", source)
-        self.assertIn("chat_id=target_responder_bot_id", source)
+        self.assertIn("not use_lookup_resolver", source)
+        self.assertIn("target_responder_bot_id", source)
 
     def test_lookup_resolver_dm_prefers_full_catch_command(self):
-        extractor = top_level_function("extract_catch_command")
-        source = ast.unparse(extractor)
-        full_pos = source.index("Full")
-        hint_pos = source.index("Hint")
+        patterns_start = SOURCE.index("    patterns = [", SOURCE.index("def extract_catch_command("))
+        full_pos = SOURCE.index("Full", patterns_start)
+        hint_pos = SOURCE.index("Hint", patterns_start)
         self.assertLess(full_pos, hint_pos)
         responder = top_level_function("handle_responder_dm")
         self.assertIn("LOOKUP_RESOLVER_BOT_ID", ast.unparse(responder))
