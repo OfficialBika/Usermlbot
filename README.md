@@ -103,7 +103,9 @@ DIRECT_DB_USE_DEFAULT_SOURCE_COLLECTIONS=true
 
 Use the same MongoDB connection URI as Adding-Helperbot (either `DIRECT_DB_MONGO_URI` or Usermlbot's existing `MONGO_URI`). Do not paste credentials into chat or commit them. `DIRECT_DB_NAME` must exactly match Adding-Helperbot's live `DB_NAME`; check its local `.env` because repository examples may differ.
 
-In this layout, Usermlbot reads the shared `characters` collection and scopes every match by Adding-Helperbot's `source_key` (for example, `items_character_catcher`). It checks the full `file_unique_ids` array first, with scalar legacy UID fields as compatibility fallbacks. Keep the built-in Source Collections map enabled so sender usernames resolve to the correct source key. This mode is read-only and does not create indexes, alter documents, or migrate data.
+In this layout, Usermlbot reads the shared `characters` collection and scopes every match by Adding-Helperbot's `source_key` (for example, `items_character_catcher`). It checks the full `file_unique_ids` array first, with scalar legacy UID fields as compatibility fallbacks. Keep the built-in Source Collections map enabled so sender usernames resolve to the correct source key. MongoDB is strictly read-only: this bot only pings the server and performs `find` / `find_one` queries. It must never insert, update, replace, delete, create indexes, change metadata, or migrate MongoDB data. Use a MongoDB account granted only the `read` role for this database as an additional server-side safeguard.
+
+All bot-owned runtime state—including `/auth` and `/unauth` permissions—is stored on the VPS filesystem in `bot_config.json` under `DATA_DIR` (default `./data`), not in MongoDB. Keep `DATA_DIR` on persistent VPS storage and back it up. SQLite catch history and captcha templates also remain local under `DATA_DIR`.
 
 Leave `DIRECT_DB_LAYOUT=legacy` (the default) for the older per-source `items_*` collection layout.
 
