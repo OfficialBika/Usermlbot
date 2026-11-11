@@ -492,9 +492,9 @@ def load_config() -> dict:
             {"a", "b", "c", "d"},
         ),
         "auto_catch_sessions": parse_session_keys(
-            os.getenv("AUTO_CATCH_SESSIONS", "a,b"),
+            os.getenv("AUTO_CATCH_SESSIONS", "a,b,c,d"),
             "a",
-            {"a", "b"},
+            {"a", "b", "c", "d"},
         ),
         "success_name": os.getenv("SUCCESS_NAME", "").strip(),
         "catch_min_delay": catch_min_delay,
@@ -2554,9 +2554,6 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     if not CONFIG.get("auto_forward_enabled"):
         return
 
-    if session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
-        return
-
     if auto_forward_paused or auto_forward_error:
         return
 
@@ -2582,6 +2579,13 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
 
     message_text = get_message_text(m)
     source_profile = get_direct_source_profile(m) if CONFIG.get("direct_db_catch_enabled") else None
+    source_key = str((source_profile or {}).get("source_bot_key") or "").strip().lower()
+    use_lookup_resolver = source_key == "character_catcher"
+
+    # Character_Catcher lookup can run on A/B/C/D independently. Other
+    # auto-catch sources keep the configured AUTO_CATCH_SESSIONS restriction.
+    if not use_lookup_resolver and session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
+        return
 
     if not is_source_bot_message(m):
         await log_auto_skip_debug(app, session_key, m, "sender_mismatch")
@@ -2626,9 +2630,6 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
 
     # Character_Catcher_Bot uses the dedicated Bika Waifu Cheat resolver.
     # It intentionally bypasses direct MongoDB character lookup entirely.
-    source_key = str((source_profile or {}).get("source_bot_key") or "").strip().lower()
-    use_lookup_resolver = source_key == "character_catcher"
-
     if CONFIG.get("direct_db_catch_enabled") and not use_lookup_resolver:
         direct_sent = await handle_direct_db_catch(app, session_key, m, rarity, group_name, source_profile)
         if direct_sent:
@@ -5872,6 +5873,16 @@ def register_handlers() -> None:
     async def responder_dm_b(_, m):
         await handle_responder_dm(app_b, "b", m)
 
+    if app_c is not None:
+        @app_c.on_message(group=-2)
+        async def responder_dm_c(_, m):
+            await handle_responder_dm(app_c, "c", m)
+
+    if app_d is not None:
+        @app_d.on_message(group=-2)
+        async def responder_dm_d(_, m):
+            await handle_responder_dm(app_d, "d", m)
+
     # Owner commands can be text OR photo+caption, e.g. /captcha_answer 1351.
     @app_a.on_message(group=0)
     async def commands_a(_, m):
@@ -5884,6 +5895,16 @@ def register_handlers() -> None:
     @app_b.on_message(group=1)
     async def general_b(_, m):
         await handle_general_message(app_b, "b", m)
+
+    if app_c is not None:
+        @app_c.on_message(group=1)
+        async def general_c(_, m):
+            await handle_general_message(app_c, "c", m)
+
+    if app_d is not None:
+        @app_d.on_message(group=1)
+        async def general_d(_, m):
+            await handle_general_message(app_d, "d", m)
 
     @app_a.on_edited_message(group=1)
     async def edited_a(_, m):
