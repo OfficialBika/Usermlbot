@@ -1105,11 +1105,11 @@ def extract_catch_command(response_text: str) -> Optional[str]:
     lines = text.splitlines()
 
     def command_from_line(line: str) -> Optional[str]:
-        match = re.search(r"(/catch(?:@\\w+)?\\s+\\S.*)", line, flags=re.IGNORECASE)
+        match = re.search(r"(/catch(?:@\w+)?\s+\S.*)", line, flags=re.IGNORECASE)
         if not match:
             return None
         command = clean_catch_command(match.group(1))
-        if not re.match(r"^/catch(?:@\\w+)?\\s+\\S", command, flags=re.IGNORECASE):
+        if not re.match(r"^/catch(?:@\w+)?\s+\S", command, flags=re.IGNORECASE):
             return None
         return command
 
@@ -1117,7 +1117,7 @@ def extract_catch_command(response_text: str) -> Optional[str]:
     # keeps Full's suffix when available while allowing Hint-only resolver replies.
     for label in ("Full", "Hint"):
         for index, line in enumerate(lines):
-            label_match = re.search(rf"\\b{label}\\s*:\\s*(.*)", line, flags=re.IGNORECASE)
+            label_match = re.search(rf"\b{label}\s*:\s*(.*)", line, flags=re.IGNORECASE)
             if not label_match:
                 continue
             command = command_from_line(label_match.group(1))
