@@ -239,9 +239,11 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("KillSignal=SIGINT", service)
         self.assertIn("Restart=on-failure", service)
 
-    def test_session_c_and_d_remain_human_chat_only(self):
-        self.assertIn('os.getenv("HUMAN_CHAT_SESSIONS", "a,b,c,d")', SOURCE)
-        self.assertIn('{"a", "b", "c", "d"}', SOURCE)
+    def test_sessions_a_through_h_are_available_for_human_and_auto_catch(self):
+        self.assertIn('os.getenv("HUMAN_CHAT_SESSIONS", "a,b,c,d,e,f,g,h")', SOURCE)
+        self.assertIn('os.getenv("AUTO_CATCH_SESSIONS", "a,b,c,d,e,f,g,h")', SOURCE)
+        self.assertIn('{"a", "b", "c", "d", "e", "f", "g", "h"}', SOURCE)
+        # Captcha and direct-DB paths intentionally remain limited to A/B.
         self.assertIn('{"a", "b"}', SOURCE)
 
     def test_env_example_does_not_contain_unknown_runtime_keys(self):
@@ -306,13 +308,13 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("LOOKUP_RESOLVER_BOT_ID", ast.unparse(responder))
 
 
-    def test_character_catcher_resolver_is_enabled_for_sessions_a_to_d(self):
+    def test_character_catcher_resolver_is_enabled_for_sessions_a_to_h(self):
         config = top_level_function("load_config")
         config_source = ast.unparse(config)
         self.assertIn("AUTO_CATCH_SESSIONS", config_source)
-        self.assertIn("a,b,c,d", config_source)
+        self.assertIn("a,b,c,d,e,f,g,h", config_source)
         self.assertIn("'a,b,c,d'", config_source)
-        self.assertIn("'c', 'd'", config_source)
+        self.assertIn("'e', 'f', 'g', 'h'", config_source)
 
         handler = top_level_function("handle_auto_forward_spawn")
         handler_source = ast.unparse(handler)
@@ -320,10 +322,10 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("not use_lookup_resolver", handler_source)
         self.assertIn("auto_catch_sessions", handler_source)
 
-    def test_optional_sessions_c_and_d_register_resolver_and_group_handlers(self):
+    def test_optional_sessions_c_through_h_register_resolver_and_group_handlers(self):
         register = top_level_function("register_handlers")
         source = ast.unparse(register)
-        for session in ("c", "d"):
+        for session in "cdefgh":
             self.assertIn(f"responder_dm_{session}", source)
             self.assertIn(f"general_{session}", source)
             self.assertIn(f'app_{session} is not None', source)
