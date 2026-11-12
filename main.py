@@ -418,7 +418,7 @@ def parse_session_keys(
     default: str = "a",
     allowed: Optional[Set[str]] = None,
 ) -> Set[str]:
-    """Parse session key lists like a,b,c,d.
+    """Parse session key lists like a,b,c,d,e,f,g,h.
 
     Auto-catch and human-chat can use sessions A-H. Captcha and direct-DB
     settings intentionally restrict their allowed set to A/B.
@@ -2639,7 +2639,7 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     source_key = str((source_profile or {}).get("source_bot_key") or "").strip().lower()
     use_lookup_resolver = source_key == "character_catcher"
 
-    # Character_Catcher lookup can run on A/B/C/D independently. Other
+    # Character_Catcher lookup can run on A-H independently. Other
     # auto-catch sources keep the configured AUTO_CATCH_SESSIONS restriction.
     if not use_lookup_resolver and session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
         return
@@ -5307,7 +5307,7 @@ async def send_help(m) -> None:
         "• <code>/unauth</code> - reply to a user or /unauth USER_ID (owner only)\n"
         "• <code>/status</code> - current group status\n"
         "• <code>/statusall</code> - all groups status\n"
-        "• <code>HUMAN_CHAT_SESSIONS=a,b,c,d</code> - A/B/C/D chat loop\n\n"
+        "• <code>HUMAN_CHAT_SESSIONS=a,b,c,d,e,f,g,h</code> - A-H chat loop\n\n"
         "<b>Auto-Forward Control:</b>\n"
         "• <code>yat</code> or <code>pause</code> - pause auto-forward\n"
         "• <code>sa</code> or <code>resume</code> - resume auto-forward\n"
