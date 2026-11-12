@@ -122,6 +122,36 @@ class RuntimeBehaviorTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_human_chat_ready_accounts_exclude_only_the_cooling_down_session(self):
+        old_clients = (
+            main.app_a, main.app_b, main.app_c, main.app_d,
+            main.app_e, main.app_f, main.app_g, main.app_h,
+        )
+        old_config = main.CONFIG
+        old_cooldown = main.human_send_cooldown_until
+        clients = tuple(object() for _ in "abcdefgh")
+        try:
+            (
+                main.app_a, main.app_b, main.app_c, main.app_d,
+                main.app_e, main.app_f, main.app_g, main.app_h,
+            ) = clients
+            main.CONFIG = {"human_chat_sessions": {"a", "b", "c"}}
+            main.human_send_cooldown_until = {"a": 300.0}
+            ready = main.get_human_chat_ready_clients(now=100.0)
+            self.assertEqual([key for key, _app in ready], ["b", "c"])
+            self.assertEqual(main.get_human_chat_cooldown_wait(now=100.0), 200.0)
+            self.assertEqual(
+                [key for key, _app in main.get_human_chat_ready_clients(now=300.0)],
+                ["a", "b", "c"],
+            )
+        finally:
+            (
+                main.app_a, main.app_b, main.app_c, main.app_d,
+                main.app_e, main.app_f, main.app_g, main.app_h,
+            ) = old_clients
+            main.CONFIG = old_config
+            main.human_send_cooldown_until = old_cooldown
+
     def test_session_app_lookup_supports_a_through_h(self):
         old_clients = (main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h)
         old_config = main.CONFIG
