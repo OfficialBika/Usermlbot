@@ -152,6 +152,55 @@ class RuntimeBehaviorTests(unittest.TestCase):
             main.CONFIG = old_config
             main.human_send_cooldown_until = old_cooldown
 
+    def test_conversation_loop_uses_other_accounts_during_floodwait(self):
+        from types import SimpleNamespace
+
+        async def scenario():
+            old_clients = (
+                main.app_a, main.app_b, main.app_c, main.app_d,
+                main.app_e, main.app_f, main.app_g, main.app_h,
+            )
+            old_config = main.CONFIG
+            old_cooldown = main.human_send_cooldown_until
+            old_enabled = set(main.enabled_groups)
+            group_id = -100987654321
+            app_a, app_b = object(), object()
+            sent_apps = []
+
+            async def fake_send_human(app, chat_id, reply_to, text, force_reply=False):
+                sent_apps.append(app)
+                main.enabled_groups.discard(group_id)
+                return SimpleNamespace(id=123)
+
+            try:
+                (
+                    main.app_a, main.app_b, main.app_c, main.app_d,
+                    main.app_e, main.app_f, main.app_g, main.app_h,
+                ) = (app_a, app_b, None, None, None, None, None, None)
+                main.CONFIG = {"human_chat_sessions": {"a", "b"}}
+                main.human_send_cooldown_until = {
+                    "a": time.monotonic() + 120
+                }
+                main.enabled_groups.add(group_id)
+                with (
+                    patch.object(main, "send_human", side_effect=fake_send_human),
+                    patch.object(main, "get_text", return_value="hello"),
+                ):
+                    await main.conversation_loop(group_id)
+
+                self.assertEqual(sent_apps, [app_b])
+            finally:
+                (
+                    main.app_a, main.app_b, main.app_c, main.app_d,
+                    main.app_e, main.app_f, main.app_g, main.app_h,
+                ) = old_clients
+                main.CONFIG = old_config
+                main.human_send_cooldown_until = old_cooldown
+                main.enabled_groups.clear()
+                main.enabled_groups.update(old_enabled)
+
+        asyncio.run(scenario())
+
     def test_session_app_lookup_supports_a_through_h(self):
         old_clients = (main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h)
         old_config = main.CONFIG
