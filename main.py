@@ -49,6 +49,10 @@ SESSA_FILE = os.path.join(LOCALES_DIR, "sessa.txt")
 SESSB_FILE = os.path.join(LOCALES_DIR, "sessb.txt")
 SESSC_FILE = os.path.join(LOCALES_DIR, "sessc.txt")
 SESSD_FILE = os.path.join(LOCALES_DIR, "sessd.txt")
+SESSE_FILE = os.path.join(LOCALES_DIR, "sesse.txt")
+SESSF_FILE = os.path.join(LOCALES_DIR, "sessf.txt")
+SESSG_FILE = os.path.join(LOCALES_DIR, "sessg.txt")
+SESSH_FILE = os.path.join(LOCALES_DIR, "sessh.txt")
 
 DATA_DIR = os.getenv("DATA_DIR", BASE_DIR).strip() or BASE_DIR
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -96,16 +100,28 @@ app_a: Optional[Client] = None
 app_b: Optional[Client] = None
 app_c: Optional[Client] = None
 app_d: Optional[Client] = None
+app_e: Optional[Client] = None
+app_f: Optional[Client] = None
+app_g: Optional[Client] = None
+app_h: Optional[Client] = None
 
 session_a_id: Optional[int] = None
 session_b_id: Optional[int] = None
 session_c_id: Optional[int] = None
 session_d_id: Optional[int] = None
+session_e_id: Optional[int] = None
+session_f_id: Optional[int] = None
+session_g_id: Optional[int] = None
+session_h_id: Optional[int] = None
 
 sessa_lines: List[str] = []
 sessb_lines: List[str] = []
 sessc_lines: List[str] = []
 sessd_lines: List[str] = []
+sesse_lines: List[str] = []
+sessf_lines: List[str] = []
+sessg_lines: List[str] = []
+sessh_lines: List[str] = []
 
 CONFIG: dict[str, Any] = {}
 
@@ -404,8 +420,8 @@ def parse_session_keys(
 ) -> Set[str]:
     """Parse session key lists like a,b,c,d.
 
-    Auto-catch related configs intentionally pass allowed={"a", "b"}
-    so optional C/D sessions stay human-chat-only unless code is explicitly changed.
+    Auto-catch and human-chat can use sessions A-H. Captcha and direct-DB
+    settings intentionally restrict their allowed set to A/B.
     """
     allowed = allowed or {"a", "b"}
     raw = (raw or default).strip().lower()
@@ -470,6 +486,10 @@ def load_config() -> dict:
         "session_b_string": getenv_session("SESSION_B_STRING"),
         "session_c_string": getenv_optional_session("SESSION_C_STRING"),
         "session_d_string": getenv_optional_session("SESSION_D_STRING"),
+        "session_e_string": getenv_optional_session("SESSION_E_STRING"),
+        "session_f_string": getenv_optional_session("SESSION_F_STRING"),
+        "session_g_string": getenv_optional_session("SESSION_G_STRING"),
+        "session_h_string": getenv_optional_session("SESSION_H_STRING"),
         "owner_ids": getenv_int_set("OWNER_IDS", "OWNER_ID"),
         "group_ids": group_ids,
         "owner_tag": owner_tag,
@@ -487,14 +507,14 @@ def load_config() -> dict:
         "debug_responder": getenv_bool("DEBUG_RESPONDER", True),
         "log_group_id": log_group_id,
         "human_chat_sessions": parse_session_keys(
-            os.getenv("HUMAN_CHAT_SESSIONS", "a,b,c,d"),
+            os.getenv("HUMAN_CHAT_SESSIONS", "a,b,c,d,e,f,g,h"),
             "a",
-            {"a", "b", "c", "d"},
+            {"a", "b", "c", "d", "e", "f", "g", "h"},
         ),
         "auto_catch_sessions": parse_session_keys(
-            os.getenv("AUTO_CATCH_SESSIONS", "a,b,c,d"),
+            os.getenv("AUTO_CATCH_SESSIONS", "a,b,c,d,e,f,g,h"),
             "a",
-            {"a", "b", "c", "d"},
+            {"a", "b", "c", "d", "e", "f", "g", "h"},
         ),
         "success_name": os.getenv("SUCCESS_NAME", "").strip(),
         "catch_min_delay": catch_min_delay,
@@ -592,11 +612,15 @@ def get_session_app(session_key: str) -> Optional[Client]:
         "b": app_b,
         "c": app_c,
         "d": app_d,
+        "e": app_e,
+        "f": app_f,
+        "g": app_g,
+        "h": app_h,
     }.get(str(session_key or "").lower())
 
 
 def get_first_available_client() -> Optional[Client]:
-    return app_a or app_b or app_c or app_d
+    return app_a or app_b or app_c or app_d or app_e or app_f or app_g or app_h
 
 
 def get_human_chat_clients() -> list[tuple[str, Client]]:
@@ -1253,6 +1277,7 @@ def format_seconds(seconds: float) -> str:
 
 async def ensure_ids() -> None:
     global session_a_id, session_b_id, session_c_id, session_d_id
+    global session_e_id, session_f_id, session_g_id, session_h_id
 
     if app_a is None or app_b is None:
         raise RuntimeError("Required clients A/B are not initialized")
@@ -1269,6 +1294,18 @@ async def ensure_ids() -> None:
     if app_d is not None and session_d_id is None:
         session_d_id = (await app_d.get_me()).id
 
+    if app_e is not None and session_e_id is None:
+        session_e_id = (await app_e.get_me()).id
+
+    if app_f is not None and session_f_id is None:
+        session_f_id = (await app_f.get_me()).id
+
+    if app_g is not None and session_g_id is None:
+        session_g_id = (await app_g.get_me()).id
+
+    if app_h is not None and session_h_id is None:
+        session_h_id = (await app_h.get_me()).id
+
 
 def get_text(which: str) -> str:
     pools = {
@@ -1276,6 +1313,10 @@ def get_text(which: str) -> str:
         "b": sessb_lines,
         "c": sessc_lines,
         "d": sessd_lines,
+        "e": sesse_lines,
+        "f": sessf_lines,
+        "g": sessg_lines,
+        "h": sessh_lines,
     }
     pool = pools.get(str(which or "").lower(), [])
 
@@ -5899,6 +5940,26 @@ def register_handlers() -> None:
         async def responder_dm_d(_, m):
             await handle_responder_dm(app_d, "d", m)
 
+    if app_e is not None:
+        @app_e.on_message(group=-2)
+        async def responder_dm_e(_, m):
+            await handle_responder_dm(app_e, "e", m)
+
+    if app_f is not None:
+        @app_f.on_message(group=-2)
+        async def responder_dm_f(_, m):
+            await handle_responder_dm(app_f, "f", m)
+
+    if app_g is not None:
+        @app_g.on_message(group=-2)
+        async def responder_dm_g(_, m):
+            await handle_responder_dm(app_g, "g", m)
+
+    if app_h is not None:
+        @app_h.on_message(group=-2)
+        async def responder_dm_h(_, m):
+            await handle_responder_dm(app_h, "h", m)
+
     # Owner commands can be text OR photo+caption, e.g. /captcha_answer 1351.
     @app_a.on_message(group=0)
     async def commands_a(_, m):
@@ -5921,6 +5982,26 @@ def register_handlers() -> None:
         @app_d.on_message(group=1)
         async def general_d(_, m):
             await handle_general_message(app_d, "d", m)
+
+    if app_e is not None:
+        @app_e.on_message(group=1)
+        async def general_e(_, m):
+            await handle_general_message(app_e, "e", m)
+
+    if app_f is not None:
+        @app_f.on_message(group=1)
+        async def general_f(_, m):
+            await handle_general_message(app_f, "f", m)
+
+    if app_g is not None:
+        @app_g.on_message(group=1)
+        async def general_g(_, m):
+            await handle_general_message(app_g, "g", m)
+
+    if app_h is not None:
+        @app_h.on_message(group=1)
+        async def general_h(_, m):
+            await handle_general_message(app_h, "h", m)
 
     @app_a.on_edited_message(group=1)
     async def edited_a(_, m):
@@ -5964,6 +6045,10 @@ async def shutdown_clients() -> None:
         _stop_client(app_b, "B"),
         _stop_client(app_c, "C"),
         _stop_client(app_d, "D"),
+        _stop_client(app_e, "E"),
+        _stop_client(app_f, "F"),
+        _stop_client(app_g, "G"),
+        _stop_client(app_h, "H"),
         return_exceptions=True,
     )
 
@@ -6007,6 +6092,10 @@ async def send_startup_summary() -> None:
         f"Session B: <code>{session_b_id}</code>\n"
         + (f"Session C: <code>{session_c_id}</code>\n" if session_c_id is not None else "")
         + (f"Session D: <code>{session_d_id}</code>\n" if session_d_id is not None else "")
+        + (f"Session E: <code>{session_e_id}</code>\n" if session_e_id is not None else "")
+        + (f"Session F: <code>{session_f_id}</code>\n" if session_f_id is not None else "")
+        + (f"Session G: <code>{session_g_id}</code>\n" if session_g_id is not None else "")
+        + (f"Session H: <code>{session_h_id}</code>\n" if session_h_id is not None else "")
         + f"Auto Forward: {'✅ ON' if CONFIG.get('auto_forward_enabled') else '❌ OFF'}\n"
         f"Human Chat Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('human_chat_sessions', []))))}</code>\n"
         f"Auto Catch Sessions: <code>{html.escape(','.join(sorted(CONFIG.get('auto_catch_sessions', []))))}</code>\n"
@@ -6028,7 +6117,9 @@ async def send_startup_summary() -> None:
 
 
 async def main() -> None:
-    global CONFIG, app_a, app_b, app_c, app_d, sessa_lines, sessb_lines, sessc_lines, sessd_lines
+    global CONFIG, app_a, app_b, app_c, app_d, app_e, app_f, app_g, app_h
+    global sessa_lines, sessb_lines, sessc_lines, sessd_lines
+    global sesse_lines, sessf_lines, sessg_lines, sessh_lines
 
     CONFIG = load_config()
     setup_logging(CONFIG["debug"])
@@ -6044,6 +6135,10 @@ async def main() -> None:
         sessb_lines = load_lines(SESSB_FILE)
         sessc_lines = load_lines(SESSC_FILE)
         sessd_lines = load_lines(SESSD_FILE)
+        sesse_lines = load_lines(SESSE_FILE)
+        sessf_lines = load_lines(SESSF_FILE)
+        sessg_lines = load_lines(SESSG_FILE)
+        sessh_lines = load_lines(SESSH_FILE)
 
         if not sessa_lines:
             logging.warning("locales/sessa.txt is empty or missing")
@@ -6056,6 +6151,9 @@ async def main() -> None:
 
         if CONFIG.get("session_d_string") and not sessd_lines:
             logging.warning("locales/sessd.txt is empty or missing; session D will use emojis")
+        for key, lines in (("e", sesse_lines), ("f", sessf_lines), ("g", sessg_lines), ("h", sessh_lines)):
+            if CONFIG.get(f"session_{key}_string") and not lines:
+                logging.warning("locales/sess%s.txt is empty or missing; session %s will use emojis", key, key.upper())
 
         app_a = Client(
             "session_a",
@@ -6091,12 +6189,28 @@ async def main() -> None:
                 in_memory=True,
             )
 
+        for key in ("e", "f", "g", "h"):
+            session_string = CONFIG.get(f"session_{key}_string")
+            if session_string:
+                client = Client(
+                    f"session_{key}",
+                    api_id=CONFIG["api_id"],
+                    api_hash=CONFIG["api_hash"],
+                    session_string=session_string,
+                    in_memory=True,
+                )
+                globals()[f"app_{key}"] = client
+
         await app_a.start()
         await app_b.start()
         if app_c is not None:
             await app_c.start()
         if app_d is not None:
             await app_d.start()
+        for key in ("e", "f", "g", "h"):
+            client = get_session_app(key)
+            if client is not None:
+                await client.start()
 
         await ensure_ids()
         register_handlers()
@@ -6109,11 +6223,15 @@ async def main() -> None:
         await init_direct_db()
 
         logging.warning(
-            "Started successfully | session_a_id=%s | session_b_id=%s | session_c_id=%s | session_d_id=%s | groups=%s | auto_forward=%s | human_chat_sessions=%s | auto_catch_sessions=%s",
+            "Started successfully | session_a_id=%s | session_b_id=%s | session_c_id=%s | session_d_id=%s | session_e_id=%s | session_f_id=%s | session_g_id=%s | session_h_id=%s | groups=%s | auto_forward=%s | human_chat_sessions=%s | auto_catch_sessions=%s",
             session_a_id,
             session_b_id,
             session_c_id,
             session_d_id,
+            session_e_id,
+            session_f_id,
+            session_g_id,
+            session_h_id,
             format_id_list(CONFIG["group_ids"]),
             CONFIG.get("auto_forward_enabled"),
             ",".join(sorted(CONFIG.get("human_chat_sessions", []))),
