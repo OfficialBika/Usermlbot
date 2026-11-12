@@ -25,13 +25,14 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertFalse(config["direct_db_catch_enabled"])
         self.assertFalse(config["captcha_solver_enabled"])
         self.assertFalse(config["captcha_auto_approve"])
-        self.assertEqual(config["human_chat_sessions"], {"a", "b", "c", "d"})
-        self.assertEqual(config["auto_catch_sessions"], {"a", "b"})
+        self.assertEqual(config["human_chat_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
+        self.assertEqual(config["auto_catch_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["captcha_solver_sessions"], {"a", "b"})
 
-    def test_session_parser_rejects_c_and_d_for_auto_catch(self):
-        parsed = main.parse_session_keys("a,b,c,d", "a", {"a", "b"})
-        self.assertEqual(parsed, {"a", "b"})
+    def test_session_parser_supports_a_through_h_for_auto_catch(self):
+        allowed = set("abcdefgh")
+        parsed = main.parse_session_keys("a,b,c,d,e,f,g,h", "a", allowed)
+        self.assertEqual(parsed, allowed)
 
     def test_adding_helperbot_layout_scopes_unified_collection_by_source_key(self):
         old_config = main.CONFIG
@@ -178,7 +179,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 self.closed = True
 
         async def scenario():
-            old_clients = (main.app_a, main.app_b, main.app_c, main.app_d)
+            old_clients = (main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h)
             old_db = main.db_conn
             old_mongo = main.direct_mongo_client
             old_items = main.direct_items_collection
@@ -187,11 +188,14 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 FakeClient(),
                 FakeClient(),
                 FakeClient(),
+                FakeClient(),
+                FakeClient(),
+                FakeClient(),
             )
             connection = sqlite3.connect(":memory:", check_same_thread=False)
             mongo = FakeMongoClient()
 
-            main.app_a, main.app_b, main.app_c, main.app_d = clients
+            main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h = clients
             main.db_conn = connection
             main.direct_mongo_client = mongo
             main.direct_items_collection = object()
@@ -222,7 +226,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 self.assertIsNone(main.direct_mongo_client)
                 self.assertIsNone(main.direct_items_collection)
             finally:
-                main.app_a, main.app_b, main.app_c, main.app_d = old_clients
+                main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h = old_clients
                 main.db_conn = old_db
                 main.direct_mongo_client = old_mongo
                 main.direct_items_collection = old_items
