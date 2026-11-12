@@ -191,6 +191,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 FakeClient(),
                 FakeClient(),
                 FakeClient(),
+                FakeClient(),
             )
             connection = sqlite3.connect(":memory:", check_same_thread=False)
             mongo = FakeMongoClient()
