@@ -639,6 +639,29 @@ def get_human_chat_clients() -> list[tuple[str, Client]]:
     return clients
 
 
+def get_human_chat_ready_clients(
+    now: Optional[float] = None,
+) -> list[tuple[str, Client]]:
+    """Return Human Chat accounts whose own FloodWait cooldown has expired."""
+    current_time = time.monotonic() if now is None else now
+    return [
+        (key, app)
+        for key, app in get_human_chat_clients()
+        if human_send_cooldown_until.get(key, 0.0) <= current_time
+    ]
+
+
+def get_human_chat_cooldown_wait(now: Optional[float] = None) -> float:
+    """Seconds until the next Human Chat account becomes available."""
+    current_time = time.monotonic() if now is None else now
+    remaining = [
+        until - current_time
+        for key, _app in get_human_chat_clients()
+        if (until := human_send_cooldown_until.get(key, 0.0)) > current_time
+    ]
+    return max(0.0, min(remaining)) if remaining else 0.0
+
+
 
 async def warmup_peer_cache(app: Optional[Client] = None, limit: int = 200) -> bool:
     """
@@ -1450,54 +1473,74 @@ async def conversation_loop(group_id: int):
         last_session_key: Optional[str] = None
 
         while group_id in enabled_groups:
-            clients = get_human_chat_clients()
-            if not clients:
-                await asyncio.sleep(2)
-                continue
+            try:
+                clients = get_human_chat_ready_clients()
+                if not clients:
+                    # Every configured account may be cooling down, but that
+                    # must pause only this group's loop, not terminate it.
+                    wait_seconds = get_human_chat_cooldown_wait()
+                    await asyncio.sleep(min(max(wait_seconds, 0.25), 5.0) if wait_seconds else 2.0)
+                    continue
 
-            available = [(key, app) for key, app in clients if key != last_session_key] or clients
-            key1, app1 = random.choice(available)
-            msg1 = await send_human(app1, group_id, None, get_text(key1))
-            last_session_key = key1
+                available = [(key, app) for key, app in clients if key != last_session_key] or clients
+                key1, app1 = random.choice(available)
+                msg1 = await send_human(app1, group_id, None, get_text(key1))
+                last_session_key = key1
 
-            if group_id not in enabled_groups:
-                break
+                if group_id not in enabled_groups:
+                    break
 
-            if not msg1:
-                await asyncio.sleep(2)
-                continue
+                if not msg1:
+                    # send_human records FloodWait against only the failed
+                    # account. Start another turn and select a ready account.
+                    await asyncio.sleep(0.1)
+                    continue
 
-            clients = get_human_chat_clients()
-            reply_candidates = [(key, app) for key, app in clients if key != key1] or clients
-            key2, app2 = random.choice(reply_candidates)
-            msg2 = await send_human(app2, group_id, msg1.id, get_text(key2), force_reply=True)
-            last_session_key = key2
+                clients = get_human_chat_ready_clients()
+                reply_candidates = [(key, app) for key, app in clients if key != key1] or clients
+                if not reply_candidates:
+                    await asyncio.sleep(0.1)
+                    continue
 
-            if group_id not in enabled_groups:
-                break
+                key2, app2 = random.choice(reply_candidates)
+                msg2 = await send_human(app2, group_id, msg1.id, get_text(key2), force_reply=True)
+                last_session_key = key2
 
-            if not msg2:
-                await asyncio.sleep(2)
-                continue
+                if group_id not in enabled_groups:
+                    break
 
-            clients = get_human_chat_clients()
-            reply_candidates = [(key, app) for key, app in clients if key != key2] or clients
-            key3, app3 = random.choice(reply_candidates)
-            await send_human(app3, group_id, msg2.id, get_text(key3), force_reply=True)
-            last_session_key = key3
+                if not msg2:
+                    await asyncio.sleep(0.1)
+                    continue
 
-            loop_pause = CONFIG.get("loop_pause_delay", 0.0)
-            if loop_pause > 0:
-                await asyncio.sleep(loop_pause)
+                clients = get_human_chat_ready_clients()
+                reply_candidates = [(key, app) for key, app in clients if key != key2] or clients
+                if not reply_candidates:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                key3, app3 = random.choice(reply_candidates)
+                await send_human(app3, group_id, msg2.id, get_text(key3), force_reply=True)
+                last_session_key = key3
+
+                loop_pause = CONFIG.get("loop_pause_delay", 0.0)
+                if loop_pause > 0:
+                    await asyncio.sleep(loop_pause)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One transient error must not kill Human Chat for this group.
+                logging.exception("conversation_loop iteration failed for %s", group_id)
+                await asyncio.sleep(1)
 
     except asyncio.CancelledError:
         pass
 
-    except Exception as e:
-        logging.warning("conversation_loop failed for %s: %s", group_id, e)
-
     finally:
-        conversation_tasks.pop(group_id, None)
+        # An old cancelled task must not remove a newer replacement task.
+        if conversation_tasks.get(group_id) is asyncio.current_task():
+            conversation_tasks.pop(group_id, None)
 
 
 async def start_group_loop(group_id: int) -> bool:
