@@ -133,6 +133,12 @@ enabled_groups: Set[int] = set()
 conversation_tasks: dict[int, asyncio.Task] = {}
 background_tasks: set[asyncio.Task] = set()
 
+# Human-chat pacing is isolated per Telegram account. The lock prevents
+# concurrent group loops from sending through the same account at once.
+human_send_locks: dict[str, asyncio.Lock] = {}
+human_send_next_at: dict[str, float] = {}
+human_send_cooldown_until: dict[str, float] = {}
+
 # Owner mention duplicate protection
 alert_seen: dict[Tuple[int, int], float] = {}
 alert_seen_lock = asyncio.Lock()
@@ -495,6 +501,7 @@ def load_config() -> dict:
         "owner_tag": owner_tag,
         "min_reply_delay": min_delay,
         "max_reply_delay": max_delay,
+        "human_chat_min_interval": max(0.0, getenv_float("HUMAN_CHAT_MIN_INTERVAL", 3.0)),
         "reply_chance": reply_chance,
         "loop_pause_delay": getenv_float("LOOP_PAUSE_DELAY", 0.0),
         "debug": getenv_bool("DEBUG", False),
@@ -1334,6 +1341,15 @@ def get_text(which: str) -> str:
     return text
 
 
+def get_human_session_key(app: Client) -> str:
+    """Return the configured account key for per-account send pacing."""
+    for key in "abcdefgh":
+        if get_session_app(key) is app:
+            return key
+    # Keeps isolated test clients and any future client from sharing a lock.
+    return f"client:{id(app)}"
+
+
 async def send_human(
     app: Client,
     chat_id: int,
@@ -1341,40 +1357,91 @@ async def send_human(
     text: str,
     force_reply: bool = False,
 ):
+    session_key = get_human_session_key(app)
+    lock = human_send_locks.setdefault(session_key, asyncio.Lock())
+
     try:
-        # Start the typing indicator before the configured human-chat delay.
-        # MIN_REPLY_DELAY / MAX_REPLY_DELAY control the full wait before sending.
-        await app.send_chat_action(chat_id, ChatAction.TYPING)
-        await asyncio.sleep(
-            random.uniform(
-                CONFIG["min_reply_delay"],
-                CONFIG["max_reply_delay"],
+        async with lock:
+            # Respect both the normal per-account interval and any server-
+            # requested FloodWait cooldown before making another API request.
+            now = time.monotonic()
+            wait_until = max(
+                human_send_next_at.get(session_key, 0.0),
+                human_send_cooldown_until.get(session_key, 0.0),
             )
-        )
+            if wait_until > now:
+                await asyncio.sleep(wait_until - now)
 
-        use_reply = bool(reply_to) and (
-            force_reply or random.random() < CONFIG["reply_chance"]
-        )
-
-        if use_reply:
-            try:
-                return await app.send_message(
-                    chat_id,
-                    text,
-                    reply_to_message_id=reply_to,
+            # Keep the configured short typing window, but serialize it per
+            # account so concurrent groups cannot burst through one session.
+            await app.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(
+                random.uniform(
+                    CONFIG["min_reply_delay"],
+                    CONFIG["max_reply_delay"],
                 )
-            except Exception as e:
-                logging.warning("reply send failed, fallback to normal message: %s", e)
+            )
 
-        return await app.send_message(chat_id, text)
+            use_reply = bool(reply_to) and (
+                force_reply or random.random() < CONFIG["reply_chance"]
+            )
+
+            try:
+                if use_reply:
+                    try:
+                        result = await app.send_message(
+                            chat_id,
+                            text,
+                            reply_to_message_id=reply_to,
+                        )
+                    except FloodWait:
+                        # FloodWait is not a reply-format failure: never retry
+                        # immediately as a normal message.
+                        raise
+                    except Exception as e:
+                        logging.warning(
+                            "reply send failed, fallback to normal message: %s",
+                            e,
+                        )
+                        result = await app.send_message(chat_id, text)
+                else:
+                    result = await app.send_message(chat_id, text)
+
+            except FloodWait as e:
+                cooldown_until = time.monotonic() + max(0, e.value)
+                human_send_cooldown_until[session_key] = max(
+                    human_send_cooldown_until.get(session_key, 0.0),
+                    cooldown_until,
+                )
+                logging.warning(
+                    "Human chat FloodWait | session=%s | wait=%s seconds",
+                    session_key.upper(),
+                    e.value,
+                )
+                return None
+
+            human_send_next_at[session_key] = (
+                time.monotonic()
+                + CONFIG.get("human_chat_min_interval", 3.0)
+            )
+            return result
 
     except FloodWait as e:
-        logging.warning("FloodWait: sleeping %s seconds", e.value)
-        await asyncio.sleep(e.value)
+        # Typing actions can also be rate-limited by Telegram.
+        cooldown_until = time.monotonic() + max(0, e.value)
+        human_send_cooldown_until[session_key] = max(
+            human_send_cooldown_until.get(session_key, 0.0),
+            cooldown_until,
+        )
+        logging.warning(
+            "Human chat FloodWait | session=%s | wait=%s seconds",
+            session_key.upper(),
+            e.value,
+        )
         return None
 
     except Exception as e:
-        logging.warning("send_human failed: %s", e)
+        logging.warning("send_human failed | session=%s: %s", session_key.upper(), e)
         return None
 
 
