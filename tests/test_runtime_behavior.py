@@ -15,6 +15,10 @@ class RuntimeBehaviorTests(unittest.TestCase):
             "API_HASH": "test-api-hash",
             "SESSION_A_STRING": "session_a_test=",
             "SESSION_B_STRING": "session_b_test=",
+            "SESSION_E_STRING": "session_e_test=",
+            "SESSION_F_STRING": "session_f_test=",
+            "SESSION_G_STRING": "session_g_test=",
+            "SESSION_H_STRING": "session_h_test=",
             "OWNER_IDS": "12345",
             "GROUP_IDS": "-1001234567890",
         }
@@ -28,6 +32,25 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(config["human_chat_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["auto_catch_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["captcha_solver_sessions"], {"a", "b"})
+        for key in "efgh":
+            self.assertEqual(config[f"session_{key}_string"], f"session_{key}_test=")
+
+    def test_session_app_lookup_supports_a_through_h(self):
+        old_clients = (main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h)
+        old_config = main.CONFIG
+        clients = tuple(object() for _ in "abcdefgh")
+        try:
+            (main.app_a, main.app_b, main.app_c, main.app_d,
+             main.app_e, main.app_f, main.app_g, main.app_h) = clients
+            main.CONFIG = {"human_chat_sessions": set("abcdefgh")}
+            for key, client in zip("abcdefgh", clients):
+                self.assertIs(main.get_session_app(key), client)
+            self.assertEqual(main.get_human_chat_clients(), list(zip("abcdefgh", clients)))
+            self.assertIs(main.get_first_available_client(), clients[0])
+        finally:
+            (main.app_a, main.app_b, main.app_c, main.app_d,
+             main.app_e, main.app_f, main.app_g, main.app_h) = old_clients
+            main.CONFIG = old_config
 
     def test_session_parser_supports_a_through_h_for_auto_catch(self):
         allowed = set("abcdefgh")
