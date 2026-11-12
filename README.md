@@ -72,10 +72,10 @@ Enable optional features only after their IDs, target groups, sources, and behav
 
 ### Session behavior
 
-- Session A and B are required.
-- Session C and D are optional and intended for human-chat use.
-- `HUMAN_CHAT_SESSIONS` can include `a,b,c,d`.
-- Auto-catch and captcha solver session settings intentionally allow only A/B.
+- Session A and B are required; sessions C through H are optional.
+- `HUMAN_CHAT_SESSIONS` can include any configured sessions from `a` through `h`.
+- `AUTO_CATCH_SESSIONS` can include any configured sessions from `a` through `h`.
+- Captcha solver and direct-DB catch session settings intentionally remain limited to A/B.
 
 ### Auto-forward requirements
 
