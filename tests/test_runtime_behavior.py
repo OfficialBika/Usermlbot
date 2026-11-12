@@ -3,7 +3,7 @@ import os
 import sqlite3
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import main
 
@@ -19,6 +19,8 @@ class RuntimeBehaviorTests(unittest.TestCase):
             "SESSION_F_STRING": "session_f_test=",
             "SESSION_G_STRING": "session_g_test=",
             "SESSION_H_STRING": "session_h_test=",
+            "MIN_REPLY_DELAY": "0.2",
+            "MAX_REPLY_DELAY": "0.5",
             "OWNER_IDS": "12345",
             "GROUP_IDS": "-1001234567890",
         }
@@ -29,11 +31,51 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertFalse(config["direct_db_catch_enabled"])
         self.assertFalse(config["captcha_solver_enabled"])
         self.assertFalse(config["captcha_auto_approve"])
+        self.assertEqual(config["min_reply_delay"], 0.2)
+        self.assertEqual(config["max_reply_delay"], 0.5)
         self.assertEqual(config["human_chat_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["auto_catch_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["captcha_solver_sessions"], {"a", "b"})
         for key in "efgh":
             self.assertEqual(config[f"session_{key}_string"], f"session_{key}_test=")
+
+    def test_send_human_uses_configured_subsecond_delay_for_typing_window(self):
+        class FakeApp:
+            def __init__(self):
+                self.calls = []
+
+            async def send_chat_action(self, chat_id, action):
+                self.calls.append(("typing", chat_id, action))
+
+            async def send_message(self, chat_id, text):
+                self.calls.append(("message", chat_id, text))
+                return "sent"
+
+        async def scenario():
+            old_config = main.CONFIG
+            try:
+                main.CONFIG = {
+                    "min_reply_delay": 0.2,
+                    "max_reply_delay": 0.5,
+                    "reply_chance": 0.25,
+                }
+                app = FakeApp()
+                with (
+                    patch.object(main.random, "uniform", return_value=0.25) as uniform,
+                    patch.object(main.asyncio, "sleep", new_callable=AsyncMock) as sleep,
+                ):
+                    result = await main.send_human(app, 123, None, "hello")
+                    self.assertEqual(result, "sent")
+                    uniform.assert_called_once_with(0.2, 0.5)
+                    sleep.assert_awaited_once_with(0.25)
+                    self.assertEqual(
+                        [call[0] for call in app.calls],
+                        ["typing", "message"],
+                    )
+            finally:
+                main.CONFIG = old_config
+
+        asyncio.run(scenario())
 
     def test_session_app_lookup_supports_a_through_h(self):
         old_clients = (main.app_a, main.app_b, main.app_c, main.app_d, main.app_e, main.app_f, main.app_g, main.app_h)
