@@ -69,7 +69,7 @@ DB_FILE = os.path.join(
     os.getenv("DB_FILE", "catch_history.db").strip() or "catch_history.db",
 )
 
-DEFAULT_OWNER_TAG = "@Bikasec"
+DEFAULT_OWNER_TAG = "@prochou"
 
 # Dedicated resolver for Character_Catcher_Bot spawns.
 LOOKUP_RESOLVER_BOT_ID = 8552029570
