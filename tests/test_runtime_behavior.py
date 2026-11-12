@@ -33,6 +33,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertFalse(config["captcha_auto_approve"])
         self.assertEqual(config["min_reply_delay"], 0.2)
         self.assertEqual(config["max_reply_delay"], 0.5)
+        self.assertEqual(config["human_chat_min_interval"], 3.0)
         self.assertEqual(config["human_chat_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["auto_catch_sessions"], {"a", "b", "c", "d", "e", "f", "g", "h"})
         self.assertEqual(config["captcha_solver_sessions"], {"a", "b"})
@@ -74,6 +75,50 @@ class RuntimeBehaviorTests(unittest.TestCase):
                     )
             finally:
                 main.CONFIG = old_config
+
+        asyncio.run(scenario())
+
+    def test_send_human_floodwait_does_not_fallback_and_sets_account_cooldown(self):
+        class FakeApp:
+            async def send_chat_action(self, chat_id, action):
+                return None
+
+            async def send_message(self, chat_id, text, **kwargs):
+                raise main.FloodWait(value=17)
+
+        async def scenario():
+            old_config = main.CONFIG
+            old_locks = main.human_send_locks
+            old_next = main.human_send_next_at
+            old_cooldown = main.human_send_cooldown_until
+            try:
+                main.CONFIG = {
+                    "min_reply_delay": 0.2,
+                    "max_reply_delay": 0.5,
+                    "reply_chance": 1.0,
+                    "human_chat_min_interval": 3.0,
+                }
+                main.human_send_locks = {}
+                main.human_send_next_at = {}
+                main.human_send_cooldown_until = {}
+                app = FakeApp()
+                with (
+                    patch.object(main.random, "uniform", return_value=0.25),
+                    patch.object(main.asyncio, "sleep", new_callable=AsyncMock) as sleep,
+                    patch.object(main.time, "monotonic", return_value=100.0),
+                ):
+                    result = await main.send_human(
+                        app, 123, 456, "hello", force_reply=True
+                    )
+                self.assertIsNone(result)
+                self.assertEqual(main.human_send_cooldown_until["client:" + str(id(app))], 117.0)
+                # Only the original reply attempt is made; no normal-message fallback.
+                self.assertEqual(sleep.await_args_list, [unittest.mock.call(0.25)])
+            finally:
+                main.CONFIG = old_config
+                main.human_send_locks = old_locks
+                main.human_send_next_at = old_next
+                main.human_send_cooldown_until = old_cooldown
 
         asyncio.run(scenario())
 
