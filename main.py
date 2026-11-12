@@ -433,8 +433,8 @@ def parse_session_keys(
 
 
 def load_config() -> dict:
-    min_delay = getenv_float("MIN_REPLY_DELAY", 2.0)
-    max_delay = getenv_float("MAX_REPLY_DELAY", 4.0)
+    min_delay = getenv_float("MIN_REPLY_DELAY", 0.2)
+    max_delay = getenv_float("MAX_REPLY_DELAY", 0.5)
 
     if min_delay > max_delay:
         min_delay, max_delay = max_delay, min_delay
@@ -1342,15 +1342,15 @@ async def send_human(
     force_reply: bool = False,
 ):
     try:
+        # Start the typing indicator before the configured human-chat delay.
+        # MIN_REPLY_DELAY / MAX_REPLY_DELAY control the full wait before sending.
+        await app.send_chat_action(chat_id, ChatAction.TYPING)
         await asyncio.sleep(
             random.uniform(
                 CONFIG["min_reply_delay"],
                 CONFIG["max_reply_delay"],
             )
         )
-
-        await app.send_chat_action(chat_id, ChatAction.TYPING)
-        await asyncio.sleep(random.uniform(0.3, 0.8))
 
         use_reply = bool(reply_to) and (
             force_reply or random.random() < CONFIG["reply_chance"]
