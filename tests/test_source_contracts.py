@@ -246,6 +246,41 @@ class RuntimeSafetyContracts(unittest.TestCase):
         # Captcha and direct-DB paths intentionally remain limited to A/B.
         self.assertIn('{"a", "b"}', SOURCE)
 
+    def test_human_chat_sessions_rotate_in_order_and_wrap(self):
+        helper = top_level_function("get_next_human_chat_client")
+        namespace = {}
+        module = ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[]))
+        exec(compile(module, "<human-chat-order-test>", "exec"), namespace)
+        pick = namespace["get_next_human_chat_client"]
+
+        configured = [(key, object()) for key in "abcdefgh"]
+        ready = configured[:]
+        order = []
+        last = None
+        for _ in range(18):
+            selected = pick(configured, ready, last)
+            self.assertIsNotNone(selected)
+            last = selected[0]
+            order.append(last)
+
+        self.assertEqual(order, list("abcdefghabcdefghab"))
+
+        # FloodWait/unavailable sessions are skipped without changing the
+        # configured order; the sequence resumes at the next ready account.
+        ready_without_b = [item for item in configured if item[0] != "b"]
+        self.assertEqual(pick(configured, ready_without_b, "a")[0], "c")
+        self.assertEqual(pick(configured, ready, "h")[0], "a")
+
+    def test_human_chat_loop_does_not_randomly_select_sessions(self):
+        loop = top_level_function("conversation_loop")
+        self.assertGreaterEqual(len(calls_named(loop, "get_next_human_chat_client")), 3)
+        self.assertFalse(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "choice"
+            for node in ast.walk(loop)
+        ))
+
     def test_env_example_does_not_contain_unknown_runtime_keys(self):
         keys = {
             match.group(1)
