@@ -2837,54 +2837,161 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
         return
 
     try:
-        forwarded = await app.forward_messages(
-            chat_id=target_responder_bot_id,
-            from_chat_id=chat_id,
-            message_ids=m.id,
-        )
-
-        forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
-
-        pending_key = (session_key, forwarded_msg.id)
-        await add_pending_response(
-            pending_key,
-            {
-                "session_key": session_key,
-                "forwarded_message_id": forwarded_msg.id,
-                "original_message_id": m.id,
-                "original_chat_id": chat_id,
-                "character_name": character_name,
-                "rarity": rarity,
-                "timestamp": now_local(),
-                "waiting_for_result": False,
-            },
-        )
-
-        if rarity and use_senpai_resolver:
-            rarity_status = f"{rarity} (FILTER BYPASSED - SENPAI)"
+        if use_senpai_resolver:
+            # Senpai's media stays in the source group. Trigger the group
+            # responder by replying /w to that exact spawn message.
+            request_message = await app.send_message(
+                chat_id=chat_id,
+                text="/w",
+                reply_to_message_id=m.id,
+            )
+            pending_key = (session_key, request_message.id)
+            await add_pending_response(
+                pending_key,
+                {
+                    "session_key": session_key,
+                    "flow": "senpai_group",
+                    "request_message_id": request_message.id,
+                    "original_message_id": m.id,
+                    "original_chat_id": chat_id,
+                    "character_name": character_name,
+                    "rarity": rarity,
+                    "timestamp": now_local(),
+                    "waiting_for_result": False,
+                },
+            )
+            action_status = "Replied /w to Senpai media in group"
         else:
-            rarity_status = f"{rarity} (ENABLED - FORWARD)" if rarity else "No rarity detected (FORWARD by default)"
+            forwarded = await app.forward_messages(
+                chat_id=target_responder_bot_id,
+                from_chat_id=chat_id,
+                message_ids=m.id,
+            )
+            forwarded_msg = forwarded[0] if isinstance(forwarded, list) else forwarded
+            pending_key = (session_key, forwarded_msg.id)
+            await add_pending_response(
+                pending_key,
+                {
+                    "session_key": session_key,
+                    "forwarded_message_id": forwarded_msg.id,
+                    "original_message_id": m.id,
+                    "original_chat_id": chat_id,
+                    "character_name": character_name,
+                    "rarity": rarity,
+                    "timestamp": now_local(),
+                    "waiting_for_result": False,
+                },
+            )
+            action_status = "Forwarded spawn to responder DM"
 
+        rarity_status = (
+            f"{rarity} (FILTER BYPASSED - SENPAI)"
+            if rarity and use_senpai_resolver
+            else (f"{rarity} (ENABLED - FORWARD)" if rarity else "No rarity detected")
+        )
         await send_log(
-            "📨 <b>Character Spawn Forwarded</b>\n"
+            "📨 <b>Character Spawn Submitted</b>\n"
             f"Session: <code>{html.escape(session_key)}</code>\n"
             f"Character: {html.escape(character_name)}\n"
             f"Rarity: {html.escape(rarity_status)}\n"
+            f"Action: {html.escape(action_status)}\n"
             f"Group: {html.escape(group_name)}\n"
             f"Group ID: <code>{chat_id}</code>\n"
             f"⏰ Time: {html.escape(now_local_str('%H:%M:%S'))}",
             parse_html=True,
             app=app,
         )
-
     except FloodWait as e:
         logging.warning("Auto-forward FloodWait: sleeping %s seconds", e.value)
         await asyncio.sleep(e.value)
-
     except Exception as e:
         logging.warning("Auto-forward failed: %s", e)
         await send_log(
             f"❌ Auto-forward error: <code>{html.escape(str(e))}</code>",
+            parse_html=True,
+            app=app,
+        )
+
+
+async def handle_senpai_group_responder(app: Client, session_key: str, m) -> None:
+    """Copy a responder bot's /pick result from the monitored group and resend it."""
+    if not CONFIG.get("auto_forward_enabled") or auto_forward_paused or auto_forward_error:
+        return
+    if not m.chat or m.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    if not m.from_user or not m.from_user.is_bot:
+        return
+
+    responder_ids = set(CONFIG.get("responder_bot_ids") or set())
+    responder_bot_id = CONFIG.get("responder_bot_id")
+    if responder_bot_id:
+        responder_ids.add(int(responder_bot_id))
+    if not responder_ids or int(m.from_user.id) not in responder_ids:
+        return
+
+    pick_command = extract_catch_command(get_message_text(m))
+    if not pick_command or not re.match(r"^/pick(?:@\\w+)?\\s+\\S", pick_command, re.IGNORECASE):
+        return
+
+    reply = getattr(m, "reply_to_message", None)
+    replied_id = getattr(reply, "id", None) if reply else None
+    await cleanup_stale_pending()
+    async with pending_lock:
+        candidates = [
+            (key, item)
+            for key, item in pending_responses.items()
+            if item.get("flow") == "senpai_group"
+            and item.get("session_key") == session_key
+            and item.get("original_chat_id") == m.chat.id
+            and not item.get("waiting_for_result")
+        ]
+        if replied_id:
+            exact = [
+                pair for pair in candidates
+                if pair[1].get("request_message_id") == replied_id
+            ]
+            if exact:
+                candidates = exact
+        candidates.sort(
+            key=lambda pair: pair[1].get("timestamp", now_local()),
+            reverse=True,
+        )
+        selected = candidates[0] if candidates else None
+
+    if not selected:
+        return
+
+    pending_key, pending = selected
+    try:
+        sent_message = await app.send_message(
+            chat_id=pending["original_chat_id"],
+            text=pick_command,
+        )
+        await update_pending_response(
+            pending_key,
+            {
+                "character_name": pick_command.split(maxsplit=1)[1].strip(),
+                "pick_command": pick_command,
+                "waiting_for_result": True,
+                "my_message_id": sent_message.id,
+            },
+        )
+        await send_log(
+            "🎯 <b>Senpai /pick copied and sent</b>\\n"
+            f"Session: <code>{html.escape(session_key)}</code>\\n"
+            f"Command: <code>{html.escape(pick_command)}</code>\\n"
+            f"Group ID: <code>{pending['original_chat_id']}</code>\\n"
+            f"⏰ Time: <code>{html.escape(now_local_str('%H:%M:%S'))}</code>",
+            parse_html=True,
+            app=app,
+        )
+    except FloodWait as e:
+        logging.warning("Senpai /pick send FloodWait: sleeping %s seconds", e.value)
+        await asyncio.sleep(e.value)
+    except Exception as e:
+        logging.warning("Senpai group /pick resend failed: %s", e)
+        await send_log(
+            f"❌ Senpai /pick resend error: <code>{html.escape(str(e))}</code>",
             parse_html=True,
             app=app,
         )
@@ -2907,6 +3014,9 @@ async def handle_responder_dm(app: Client, session_key: str, m) -> None:
         if auto_forward_paused or auto_forward_error:
             return
         if not m.chat or not getattr(m, "id", None):
+            return
+        if m.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await handle_senpai_group_responder(app, session_key, m)
             return
         if m.chat.type not in {ChatType.PRIVATE, ChatType.BOT}:
             return
