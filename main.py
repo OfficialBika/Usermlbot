@@ -2775,6 +2775,11 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     use_senpai_resolver = source_key == "senpai_catcher"
     use_forward_resolver = use_lookup_resolver or use_senpai_resolver
 
+    # Senpai's /w trigger is intentionally sent by Session A only.
+    # All configured sessions still listen for the responder's group /pick result.
+    if use_senpai_resolver and session_key != "a":
+        return
+
     # Dedicated forward resolvers can use sessions A-H independently.
     # Other auto-catch sources keep the configured AUTO_CATCH_SESSIONS restriction.
     if not use_forward_resolver and session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
@@ -2947,9 +2952,8 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
             (key, item)
             for key, item in pending_responses.items()
             if item.get("flow") == "senpai_group"
-            and item.get("session_key") == session_key
             and item.get("original_chat_id") == m.chat.id
-            and not item.get("waiting_for_result")
+            and session_key not in item.setdefault("responder_sessions_sent", set())
         ]
         if replied_id:
             exact = [
@@ -2963,11 +2967,17 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
             reverse=True,
         )
         selected = candidates[0] if candidates else None
+        if selected:
+            pending_key, pending = selected
+            # Reserve this account atomically; each session sends this result once.
+            pending.setdefault("responder_sessions_sent", set()).add(session_key)
+        else:
+            pending_key = None
+            pending = None
 
-    if not selected:
+    if not selected or not pending_key or not pending:
         return
 
-    pending_key, pending = selected
     try:
         sent_message = await app.send_message(
             chat_id=pending["original_chat_id"],
@@ -2978,7 +2988,6 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
             {
                 "character_name": pick_command.split(maxsplit=1)[1].strip(),
                 "pick_command": pick_command,
-                "waiting_for_result": True,
                 "my_message_id": sent_message.id,
             },
         )
@@ -2992,9 +3001,15 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
             app=app,
         )
     except FloodWait as e:
+        async with pending_lock:
+            if pending_key in pending_responses:
+                pending_responses[pending_key].setdefault("responder_sessions_sent", set()).discard(session_key)
         logging.warning("Senpai /pick send FloodWait: sleeping %s seconds", e.value)
         await asyncio.sleep(e.value)
     except Exception as e:
+        async with pending_lock:
+            if pending_key in pending_responses:
+                pending_responses[pending_key].setdefault("responder_sessions_sent", set()).discard(session_key)
         logging.warning("Senpai group /pick resend failed: %s", e)
         await send_log(
             f"❌ Senpai /pick resend error: <code>{html.escape(str(e))}</code>",
