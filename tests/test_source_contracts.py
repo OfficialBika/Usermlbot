@@ -325,6 +325,11 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("senpai_catcher", handler_source)
         self.assertIn("use_forward_resolver", handler_source)
         self.assertIn("responder_bot_id", handler_source)
+        # Senpai ignores Rarity toggles; CatchBot and all other sources retain the filter.
+        self.assertIn(
+            "if not use_senpai_resolver and rarity and not is_rarity_enabled(rarity)",
+            handler_source,
+        )
 
     def test_character_catcher_resolver_is_enabled_for_sessions_a_to_h(self):
         config = top_level_function("load_config")
