@@ -2845,7 +2845,7 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
                 text="/w",
                 reply_to_message_id=m.id,
             )
-            pending_key = (session_key, request_message.id)
+            pending_key = (session_key, time.time_ns())
             await add_pending_response(
                 pending_key,
                 {
@@ -2930,7 +2930,7 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
         return
 
     pick_command = extract_catch_command(get_message_text(m))
-    if not pick_command or not re.match(r"^/pick(?:@\\w+)?\\s+\\S", pick_command, re.IGNORECASE):
+    if not pick_command or not re.match(r"^/pick(?:@\w+)?\s+\S", pick_command, re.IGNORECASE):
         return
 
     reply = getattr(m, "reply_to_message", None)
@@ -2977,10 +2977,10 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
             },
         )
         await send_log(
-            "🎯 <b>Senpai /pick copied and sent</b>\\n"
-            f"Session: <code>{html.escape(session_key)}</code>\\n"
-            f"Command: <code>{html.escape(pick_command)}</code>\\n"
-            f"Group ID: <code>{pending['original_chat_id']}</code>\\n"
+            "🎯 <b>Senpai /pick copied and sent</b>\n"
+            f"Session: <code>{html.escape(session_key)}</code>\n"
+            f"Command: <code>{html.escape(pick_command)}</code>\n"
+            f"Group ID: <code>{pending['original_chat_id']}</code>\n"
             f"⏰ Time: <code>{html.escape(now_local_str('%H:%M:%S'))}</code>",
             parse_html=True,
             app=app,
