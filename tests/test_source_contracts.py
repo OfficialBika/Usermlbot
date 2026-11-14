@@ -331,6 +331,22 @@ class RuntimeSafetyContracts(unittest.TestCase):
             handler_source,
         )
 
+    def test_senpai_uses_group_reply_w_and_resends_responder_pick(self):
+        spawn = ast.unparse(top_level_function("handle_auto_forward_spawn"))
+        self.assertIn('text="/w"', spawn)
+        self.assertIn("reply_to_message_id=m.id", spawn)
+        self.assertIn('"flow": "senpai_group"', spawn)
+
+        responder = top_level_function("handle_senpai_group_responder")
+        responder_source = ast.unparse(responder)
+        self.assertIn("ChatType.GROUP", responder_source)
+        self.assertIn("ChatType.SUPERGROUP", responder_source)
+        self.assertIn("responder_ids", responder_source)
+        self.assertIn('r"^/pick(?:@\\w+)?\\s+\\S"', responder_source)
+        self.assertIn("item.get(\"flow\") == \"senpai_group\"", responder_source)
+        self.assertIn("pick_command", responder_source)
+        self.assertTrue(calls_named(top_level_function("handle_responder_dm"), "handle_senpai_group_responder"))
+
     def test_character_catcher_resolver_is_enabled_for_sessions_a_to_h(self):
         config = top_level_function("load_config")
         config_source = ast.unparse(config)
