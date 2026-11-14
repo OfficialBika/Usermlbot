@@ -74,6 +74,7 @@ Enable optional features only after their IDs, target groups, sources, and behav
 
 - Session A and B are required; sessions C through H are optional.
 - `HUMAN_CHAT_SESSIONS` can include any configured sessions from `a` through `h`.
+- Human Chat sends in deterministic round-robin order (A → B → C → D → E → F → G → H → A). If a session is cooling down or unavailable, it skips that account for the turn and continues with the next ready session; the order resumes around the configured session list. Each group maintains its own rotation, while per-account send locks and FloodWait cooldowns protect sessions shared by multiple groups.
 - `AUTO_CATCH_SESSIONS` can include any configured sessions from `a` through `h`.
 - Captcha solver and direct-DB catch session settings intentionally remain limited to A/B.
 
