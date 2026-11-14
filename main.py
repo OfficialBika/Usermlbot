@@ -2840,18 +2840,13 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
         if use_senpai_resolver:
             # Senpai's media stays in the source group. Trigger the group
             # responder by replying /w to that exact spawn message.
-            request_message = await app.send_message(
-                chat_id=chat_id,
-                text="/w",
-                reply_to_message_id=m.id,
-            )
             pending_key = (session_key, time.time_ns())
             await add_pending_response(
                 pending_key,
                 {
                     "session_key": session_key,
                     "flow": "senpai_group",
-                    "request_message_id": request_message.id,
+                    "request_message_id": None,
                     "original_message_id": m.id,
                     "original_chat_id": chat_id,
                     "character_name": character_name,
@@ -2859,6 +2854,15 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
                     "timestamp": now_local(),
                     "waiting_for_result": False,
                 },
+            )
+            request_message = await app.send_message(
+                chat_id=chat_id,
+                text="/w",
+                reply_to_message_id=m.id,
+            )
+            await update_pending_response(
+                pending_key,
+                {"request_message_id": request_message.id},
             )
             action_status = "Replied /w to Senpai media in group"
         else:
@@ -2930,6 +2934,8 @@ async def handle_senpai_group_responder(app: Client, session_key: str, m) -> Non
         return
 
     pick_command = extract_catch_command(get_message_text(m))
+    if not pick_command:
+        pick_command = extract_catch_command_from_buttons(m)
     if not pick_command or not re.match(r"^/pick(?:@\w+)?\s+\S", pick_command, re.IGNORECASE):
         return
 
