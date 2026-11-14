@@ -248,7 +248,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
 
     def test_human_chat_sessions_rotate_in_order_and_wrap(self):
         helper = top_level_function("get_next_human_chat_client")
-        namespace = {}
+        namespace = {"Optional": __import__("typing").Optional, "Client": object}
         module = ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[]))
         exec(compile(module, "<human-chat-order-test>", "exec"), namespace)
         pick = namespace["get_next_human_chat_client"]
