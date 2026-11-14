@@ -339,6 +339,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
         ))
         self.assertIn("reply_to_message_id=m.id", spawn)
         self.assertIn("senpai_group", spawn)
+        self.assertIn('session_key != "a"', spawn)
 
         responder = top_level_function("handle_senpai_group_responder")
         responder_source = ast.unparse(responder)
@@ -351,6 +352,8 @@ class RuntimeSafetyContracts(unittest.TestCase):
             for node in ast.walk(responder)
         ))
         self.assertIn("senpai_group", responder_source)
+        self.assertIn("responder_sessions_sent", responder_source)
+        self.assertIn("session_key not in item.setdefault", responder_source)
         self.assertIn("pick_command", responder_source)
         self.assertTrue(calls_named(top_level_function("handle_responder_dm"), "handle_senpai_group_responder"))
 
