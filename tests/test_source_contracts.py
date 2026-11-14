@@ -303,10 +303,28 @@ class RuntimeSafetyContracts(unittest.TestCase):
             extract("Some text\n/catch Tanjiro\nPowered by resolver"),
             "/catch Tanjiro",
         )
+        self.assertEqual(extract("Full: /pick Sakura [SSR]"), "/pick Sakura [SSR]")
+        self.assertEqual(extract("Hint: /pick"), None)
 
         responder = top_level_function("handle_responder_dm")
         self.assertIn("LOOKUP_RESOLVER_BOT_ID", ast.unparse(responder))
 
+
+    def test_senpai_catcher_is_forwarded_and_pick_commands_are_supported(self):
+        config = top_level_function("load_config")
+        self.assertIn("SENPAI_CATCHER_BOT_ID", ast.unparse(config))
+        self.assertIn("8532697507", ast.unparse(config))
+
+        profile = top_level_function("get_direct_source_profile")
+        self.assertIn("senpai_catcher", ast.unparse(profile))
+        source_check = top_level_function("is_source_bot_message")
+        self.assertIn("senpai_catcher_bot_id", ast.unparse(source_check))
+
+        handler = top_level_function("handle_auto_forward_spawn")
+        handler_source = ast.unparse(handler)
+        self.assertIn("senpai_catcher", handler_source)
+        self.assertIn("use_forward_resolver", handler_source)
+        self.assertIn("responder_bot_id", handler_source)
 
     def test_character_catcher_resolver_is_enabled_for_sessions_a_to_h(self):
         config = top_level_function("load_config")
