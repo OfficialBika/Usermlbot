@@ -2799,7 +2799,9 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     character_name = extract_character_name_from_message(message_text) or "Unknown"
     group_name = get_group_name(chat_id)
 
-    if rarity and not is_rarity_enabled(rarity):
+    # SenpaiCatcher must catch every spawn regardless of the Rarity toggles.
+    # Keep the existing rarity filter unchanged for CatchBot and other sources.
+    if not use_senpai_resolver and rarity and not is_rarity_enabled(rarity):
         await log_ignored_character(
             character_name,
             rarity,
@@ -2858,7 +2860,10 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
             },
         )
 
-        rarity_status = f"{rarity} (ENABLED - FORWARD)" if rarity else "No rarity detected (FORWARD by default)"
+        if rarity and use_senpai_resolver:
+            rarity_status = f"{rarity} (FILTER BYPASSED - SENPAI)"
+        else:
+            rarity_status = f"{rarity} (ENABLED - FORWARD)" if rarity else "No rarity detected (FORWARD by default)"
 
         await send_log(
             "📨 <b>Character Spawn Forwarded</b>\n"
