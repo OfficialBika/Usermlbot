@@ -93,7 +93,7 @@ SENPAI_CATCHER_BOT_ID=8532697507
 RESPONDER_BOT_ID=123456789
 ```
 
-SenpaiCatcher spawn messages are forwarded to the configured responder, and complete `/pick` commands returned by that bot are sent to the original group. The feature uses the same enabled source groups, pending-response tracking, and A-H session handlers as the existing forward flow. SenpaiCatcher ignores all Rarity on/off toggles and forwards every recognized spawn; the existing Rarity filter remains unchanged for CatchBot and other sources. `RESPONDER_BOT_IDS` may be used for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
+SenpaiCatcher media is not forwarded to the responder DM. When a Senpai spawn appears in an enabled source group, Usermlbot replies to that exact media message with `/w`. The configured responder bot must be a member of the same group; when it returns a complete `/pick name` command, Usermlbot copies that command text and sends it back into the group. The result is matched to the pending `/w` request in that group and session. This flow uses the same enabled source groups and A-H session handlers as the existing forward flow. SenpaiCatcher ignores all Rarity on/off toggles; the existing Rarity filter and DM-forward flow remain unchanged for CatchBot and other sources. `RESPONDER_BOT_IDS` may be used for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
 
 #### Sharing the current Adding-Helperbot database
 
