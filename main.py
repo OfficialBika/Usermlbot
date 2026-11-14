@@ -653,6 +653,30 @@ def get_human_chat_ready_clients(
     ]
 
 
+def get_next_human_chat_client(
+    configured_clients: list[tuple[str, Client]],
+    ready_clients: list[tuple[str, Client]],
+    last_session_key: Optional[str],
+) -> Optional[tuple[str, Client]]:
+    """Pick the next ready account in configured A-H order, wrapping after H."""
+    if not configured_clients or not ready_clients:
+        return None
+
+    ready_by_key = dict(ready_clients)
+    ordered_keys = [key for key, _app in configured_clients]
+    if last_session_key in ordered_keys:
+        start = (ordered_keys.index(last_session_key) + 1) % len(ordered_keys)
+    else:
+        start = 0
+
+    for offset in range(len(ordered_keys)):
+        key = ordered_keys[(start + offset) % len(ordered_keys)]
+        app = ready_by_key.get(key)
+        if app is not None:
+            return key, app
+    return None
+
+
 def get_human_chat_cooldown_wait(now: Optional[float] = None) -> float:
     """Seconds until the next Human Chat account becomes available."""
     current_time = time.monotonic() if now is None else now
@@ -1473,19 +1497,24 @@ async def send_human(
 async def conversation_loop(group_id: int):
     try:
         last_session_key: Optional[str] = None
+        configured_clients = get_human_chat_clients()
 
         while group_id in enabled_groups:
             try:
-                clients = get_human_chat_ready_clients()
-                if not clients:
-                    # Every configured account may be cooling down, but that
-                    # must pause only this group's loop, not terminate it.
+                ready_clients = get_human_chat_ready_clients()
+                selected = get_next_human_chat_client(
+                    configured_clients,
+                    ready_clients,
+                    last_session_key,
+                )
+                if selected is None:
+                    # Every configured account may be cooling down. Keep this
+                    # group alive and resume at the next account when ready.
                     wait_seconds = get_human_chat_cooldown_wait()
                     await asyncio.sleep(min(max(wait_seconds, 0.25), 5.0) if wait_seconds else 2.0)
                     continue
 
-                available = [(key, app) for key, app in clients if key != last_session_key] or clients
-                key1, app1 = random.choice(available)
+                key1, app1 = selected
                 msg1 = await send_human(app1, group_id, None, get_text(key1))
                 last_session_key = key1
 
@@ -1493,18 +1522,22 @@ async def conversation_loop(group_id: int):
                     break
 
                 if not msg1:
-                    # send_human records FloodWait against only the failed
-                    # account. Start another turn and select a ready account.
+                    # Failed/cooling account is skipped; the next turn advances
+                    # to the next configured session instead of retrying it.
                     await asyncio.sleep(0.1)
                     continue
 
-                clients = get_human_chat_ready_clients()
-                reply_candidates = [(key, app) for key, app in clients if key != key1] or clients
-                if not reply_candidates:
+                ready_clients = get_human_chat_ready_clients()
+                selected = get_next_human_chat_client(
+                    configured_clients,
+                    ready_clients,
+                    last_session_key,
+                )
+                if selected is None:
                     await asyncio.sleep(0.1)
                     continue
 
-                key2, app2 = random.choice(reply_candidates)
+                key2, app2 = selected
                 msg2 = await send_human(app2, group_id, msg1.id, get_text(key2), force_reply=True)
                 last_session_key = key2
 
@@ -1515,13 +1548,17 @@ async def conversation_loop(group_id: int):
                     await asyncio.sleep(0.1)
                     continue
 
-                clients = get_human_chat_ready_clients()
-                reply_candidates = [(key, app) for key, app in clients if key != key2] or clients
-                if not reply_candidates:
+                ready_clients = get_human_chat_ready_clients()
+                selected = get_next_human_chat_client(
+                    configured_clients,
+                    ready_clients,
+                    last_session_key,
+                )
+                if selected is None:
                     await asyncio.sleep(0.1)
                     continue
 
-                key3, app3 = random.choice(reply_candidates)
+                key3, app3 = selected
                 await send_human(app3, group_id, msg2.id, get_text(key3), force_reply=True)
                 last_session_key = key3
 
