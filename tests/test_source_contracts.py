@@ -342,7 +342,11 @@ class RuntimeSafetyContracts(unittest.TestCase):
         self.assertIn("ChatType.GROUP", responder_source)
         self.assertIn("ChatType.SUPERGROUP", responder_source)
         self.assertIn("responder_ids", responder_source)
-        self.assertIn('r"^/pick(?:@\\w+)?\\s+\\S"', responder_source)
+        self.assertTrue(any(
+            isinstance(node, ast.Constant)
+            and node.value == r"^/pick(?:@\w+)?\s+\S"
+            for node in ast.walk(responder)
+        ))
         self.assertIn("item.get(\"flow\") == \"senpai_group\"", responder_source)
         self.assertIn("pick_command", responder_source)
         self.assertTrue(calls_named(top_level_function("handle_responder_dm"), "handle_senpai_group_responder"))
