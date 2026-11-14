@@ -458,6 +458,7 @@ def load_config() -> dict:
     auto_forward_enabled = getenv_bool("AUTO_FORWARD_ENABLED", False)
     direct_db_catch_enabled = getenv_bool("DIRECT_DB_CATCH_ENABLED", False)
     bot_id = getenv_optional_int("BOT_ID")
+    senpai_catcher_bot_id = getenv_optional_int("SENPAI_CATCHER_BOT_ID", default=8532697507)
 
     # Forward target bot. Keep RESPONDER_BOT_ID as default target.
     # RESPONDER_BOT_IDS is optional and only used for accepting replies from multiple resolver bots.
@@ -472,8 +473,8 @@ def load_config() -> dict:
     if auto_forward_enabled:
         # Direct DB support-bot mode can read every source bot from MongoDB,
         # so BOT_ID is optional when DIRECT_DB_CATCH_ENABLED=true.
-        if bot_id is None and not direct_db_catch_enabled:
-            raise RuntimeError("BOT_ID is required when AUTO_FORWARD_ENABLED=true and DIRECT_DB_CATCH_ENABLED=false")
+        if bot_id is None and senpai_catcher_bot_id is None and not direct_db_catch_enabled:
+            raise RuntimeError("BOT_ID or SENPAI_CATCHER_BOT_ID is required when AUTO_FORWARD_ENABLED=true and DIRECT_DB_CATCH_ENABLED=false")
         if not direct_db_catch_enabled and responder_bot_id is None and not responder_bot_ids:
             raise RuntimeError("RESPONDER_BOT_ID or RESPONDER_BOT_IDS is required when AUTO_FORWARD_ENABLED=true, unless DIRECT_DB_CATCH_ENABLED=true")
 
@@ -508,6 +509,7 @@ def load_config() -> dict:
         "auto_forward_enabled": auto_forward_enabled,
         "auto_group_enabled_default": getenv_bool("AUTO_GROUPS_ENABLED_BY_DEFAULT", False),
         "bot_id": bot_id,
+        "senpai_catcher_bot_id": senpai_catcher_bot_id,
         "source_bot_strict": getenv_bool("SOURCE_BOT_STRICT", getenv_bool("BOT_ID_STRICT", True)),
         "responder_bot_id": responder_bot_id or (next(iter(responder_bot_ids)) if responder_bot_ids else None),
         "responder_bot_ids": responder_bot_ids,
@@ -1134,7 +1136,7 @@ def clean_catch_command(cmd: str) -> str:
         flags=re.IGNORECASE,
     )[0].strip()
 
-    if not cmd.lower().startswith("/catch"):
+    if not re.match(r"^/(?:catch|pick)(?:@\w+)?(?:\s|$)", cmd, flags=re.IGNORECASE):
         return ""
     return cmd
 
@@ -1159,11 +1161,11 @@ def extract_catch_command(response_text: str) -> Optional[str]:
     lines = text.splitlines()
 
     def command_from_line(line: str) -> Optional[str]:
-        match = re.search(r"(/catch(?:@\w+)?\s+\S.*)", line, flags=re.IGNORECASE)
+        match = re.search(r"(/(?:catch|pick)(?:@\w+)?\s+\S.*)", line, flags=re.IGNORECASE)
         if not match:
             return None
         command = clean_catch_command(match.group(1))
-        if not re.match(r"^/catch(?:@\w+)?\s+\S", command, flags=re.IGNORECASE):
+        if not re.match(r"^/(?:catch|pick)(?:@\w+)?\s+\S", command, flags=re.IGNORECASE):
             return None
         return command
 
@@ -1994,6 +1996,19 @@ def get_direct_source_profile(m) -> Optional[dict[str, Any]]:
         if profile:
             return profile
 
+    # SenpaiCatcherBot is a forward-only source; its resolver returns /pick.
+    senpai_bot_id = CONFIG.get("senpai_catcher_bot_id", 8532697507)
+    if senpai_bot_id and int(senpai_bot_id) in get_message_sender_candidates(m):
+        return {
+            "bot_id": int(senpai_bot_id),
+            "source_bot_key": "senpai_catcher",
+            "username": "SenpaiCatcherBot",
+            "display_name": "@SenpaiCatcherBot",
+            "command_name": "/pick",
+            "items_collection": "items_senpai_catcher",
+            "raw": {},
+        }
+
     # Backward compatible single-source fallback.
     bot_id = CONFIG.get("bot_id")
     if bot_id and int(bot_id) in get_message_sender_candidates(m):
@@ -2671,6 +2686,11 @@ def is_source_bot_message(m) -> bool:
     sender_ids = get_message_sender_candidates(m)
     sender_usernames = get_message_sender_usernames(m)
 
+    # SenpaiCatcherBot is accepted even when MongoDB lookup is disabled.
+    senpai_bot_id = CONFIG.get("senpai_catcher_bot_id", 8532697507)
+    if senpai_bot_id and int(senpai_bot_id) in sender_ids:
+        return True
+
     # Multi support-bot mode: accept bot IDs OR usernames loaded from Lookup DB/map.
     if CONFIG.get("direct_db_catch_enabled") and CONFIG.get("direct_db_use_support_bots", True):
         if any(int(sender_id) in direct_supported_bots_by_id for sender_id in sender_ids):
@@ -2727,7 +2747,11 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
     bot_id = CONFIG.get("bot_id")
     responder_bot_id = CONFIG.get("responder_bot_id")
 
-    if not CONFIG.get("direct_db_catch_enabled") and not bot_id:
+    if (
+        not CONFIG.get("direct_db_catch_enabled")
+        and not bot_id
+        and not CONFIG.get("senpai_catcher_bot_id", 8532697507)
+    ):
         return
 
     if not responder_bot_id and not CONFIG.get("direct_db_catch_enabled"):
@@ -2745,13 +2769,15 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
         return
 
     message_text = get_message_text(m)
-    source_profile = get_direct_source_profile(m) if CONFIG.get("direct_db_catch_enabled") else None
+    source_profile = get_direct_source_profile(m)
     source_key = str((source_profile or {}).get("source_bot_key") or "").strip().lower()
     use_lookup_resolver = source_key == "character_catcher"
+    use_senpai_resolver = source_key == "senpai_catcher"
+    use_forward_resolver = use_lookup_resolver or use_senpai_resolver
 
-    # Character_Catcher lookup can run on A-H independently. Other
-    # auto-catch sources keep the configured AUTO_CATCH_SESSIONS restriction.
-    if not use_lookup_resolver and session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
+    # Dedicated forward resolvers can use sessions A-H independently.
+    # Other auto-catch sources keep the configured AUTO_CATCH_SESSIONS restriction.
+    if not use_forward_resolver and session_key not in CONFIG.get("auto_catch_sessions", {"a", "b"}):
         return
 
     if not is_source_bot_message(m):
@@ -2797,7 +2823,7 @@ async def handle_auto_forward_spawn(app: Client, session_key: str, m) -> None:
 
     # Character_Catcher_Bot uses the dedicated Bika Waifu Cheat resolver.
     # It intentionally bypasses direct MongoDB character lookup entirely.
-    if CONFIG.get("direct_db_catch_enabled") and not use_lookup_resolver:
+    if CONFIG.get("direct_db_catch_enabled") and not use_forward_resolver:
         direct_sent = await handle_direct_db_catch(app, session_key, m, rarity, group_name, source_profile)
         if direct_sent:
             return
