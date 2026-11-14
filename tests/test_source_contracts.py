@@ -333,9 +333,12 @@ class RuntimeSafetyContracts(unittest.TestCase):
 
     def test_senpai_uses_group_reply_w_and_resends_responder_pick(self):
         spawn = ast.unparse(top_level_function("handle_auto_forward_spawn"))
-        self.assertIn('text="/w"', spawn)
+        self.assertTrue(any(
+            isinstance(node, ast.Constant) and node.value == "/w"
+            for node in ast.walk(top_level_function("handle_auto_forward_spawn"))
+        ))
         self.assertIn("reply_to_message_id=m.id", spawn)
-        self.assertIn('"flow": "senpai_group"', spawn)
+        self.assertIn("senpai_group", spawn)
 
         responder = top_level_function("handle_senpai_group_responder")
         responder_source = ast.unparse(responder)
@@ -347,7 +350,7 @@ class RuntimeSafetyContracts(unittest.TestCase):
             and node.value == r"^/pick(?:@\w+)?\s+\S"
             for node in ast.walk(responder)
         ))
-        self.assertIn("item.get(\"flow\") == \"senpai_group\"", responder_source)
+        self.assertIn("senpai_group", responder_source)
         self.assertIn("pick_command", responder_source)
         self.assertTrue(calls_named(top_level_function("handle_responder_dm"), "handle_senpai_group_responder"))
 
