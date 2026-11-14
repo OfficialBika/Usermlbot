@@ -79,14 +79,21 @@ Enable optional features only after their IDs, target groups, sources, and behav
 
 ### Auto-forward requirements
 
-When `AUTO_FORWARD_ENABLED=true` and `DIRECT_DB_CATCH_ENABLED=false`, configure:
+When `AUTO_FORWARD_ENABLED=true` and `DIRECT_DB_CATCH_ENABLED=false`, configure the source and responder:
 
 ```env
 BOT_ID=123456789
 RESPONDER_BOT_ID=123456789
 ```
 
-Alternatively, use `RESPONDER_BOT_IDS` for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
+For SenpaiCatcher-only forwarding, `BOT_ID` is optional because the source ID defaults to `8532697507`:
+
+```env
+SENPAI_CATCHER_BOT_ID=8532697507
+RESPONDER_BOT_ID=123456789
+```
+
+SenpaiCatcher spawn messages are forwarded to the configured responder, and complete `/pick` commands returned by that bot are sent to the original group. The feature uses the same enabled source groups, rarity filters, pending-response tracking, and A-H session handlers as the existing forward flow. `RESPONDER_BOT_IDS` may be used for multiple responder bots. Direct DB Catch requires a MongoDB URI and database name. Its MongoDB connection is intended for read-only lookup; the bot does not create indexes or write application documents to that database.
 
 #### Sharing the current Adding-Helperbot database
 
